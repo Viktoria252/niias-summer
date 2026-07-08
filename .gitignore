@@ -1,0 +1,40 @@
+# === Общие настройки ОС и сред разработки ===
+.DS_Store
+Thumbs.db
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+
+# === Игнорирование сборщика Java / Maven (папка backend) ===
+**/target/
+**/*.class
+**/mvnw
+**/mvnw.cmd
+**/.mvn/
+.mvn/timing.properties
+.mvn/wrapper/.maven-wrapper.properties
+
+# === Игнорирование зависимостей Python (папка fastapi_ml) ===
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.venv/
+venv/
+ENV/
+env/
+.pytest_cache/
+
+# === Игнорирование зависимостей JS / Node.js (папка frontend) ===
+**/node_modules/
+**/dist/
+**/build/
+.npm
+.eslintcache
+
+# === Локальные данные, логи и секреты ===
+*.log
+.env
+.env.local

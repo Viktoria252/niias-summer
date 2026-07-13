@@ -19,18 +19,15 @@ async def health_check():
 @app.post("/process", response_model=OCRResponse)
 async def ocr_endpoint(
     file: UploadFile = File(...),
-    prompt: str = Form("Извлеки следующие данные в JSON-формате:"),
     max_tokens: int = Form(512),
 ):
-
     try:
         image_bytes = await file.read()
         if not image_bytes:
             raise HTTPException(status_code=400, detail="Empty file")
 
         result = client.recognize(
-            image_bytes=image_bytes,
-            prompt=prompt,
+            images=image_bytes,
             max_tokens=max_tokens,
         )
         return OCRResponse(text=result, model=MODEL_NAME)

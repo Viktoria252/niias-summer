@@ -1,9 +1,9 @@
 import base64
 import logging
-from typing import Optional
+from typing import Optional, Union, List
 
 import httpx
-from src.config import VLLM_URL, MODEL_NAME, VLLM_TIMEOUT, ENABLE_THINKING
+from src.config import VLLM_URL, MODEL_NAME, VLLM_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +13,6 @@ class VLLMClient:
         base_url: str = VLLM_URL,
         model: str = MODEL_NAME,
         timeout: int = VLLM_TIMEOUT,
-        enable_thinking: bool = ENABLE_THINKING,
     ):
         self.base_url = base_url
         self.model = model
@@ -25,41 +24,49 @@ class VLLMClient:
 
     def recognize(
         self,
-        image_bytes: bytes,
-        prompt: str = "Извлеки следующие данные в JSON-формате: ",
+        images: Union[bytes, List[bytes]],
+        prompt: str = """Распознай текст на изображении и извлеки следующие поля в формате JSON:
+- Место отказа (дорога, станция, перегон, км, пикеты)
+- Дата (год-месяц-день)
+- Время начала отказа (часы-минуты)
+- Серия локомотива
+- Номер секции локомотива
+- Договор (номер и наименование)
+- Причина отказа
+- Вид отказа (производственный, деградационный и т.п.)
+- Оборудование локомотива
+- Наименование виновной организации (строго название компании в кавычках)
+
+Если какое-то поле отсутствует, оставь его пустым или со значением null.
+Ответ дай строго в виде JSON без пояснений.""",
         max_tokens: int = 512,
         temperature: float = 0.0,
-        enable_thinking: bool = None,
     ) -> str:
-        thinking = enable_thinking if enable_thinking is not None else self.enable_thinking
 
-        image_base64 = self._encode_image_to_base64(image_bytes)
+        if isinstance(images, bytes):
+            images = [images]
 
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{image_base64}"}
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt
-                    }
-                ]
-            }
-        ]
+        content = []
+        for image_bytes in images:
+            image_base64 = self._encode_image_to_base64(image_bytes)
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{image_base64}"}
+            })
+        content.append({
+            "type": "text",
+            "text": prompt
+        })
+
+        messages = [{"role": "user", "content": content}]
 
         payload = {
             "model": self.model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "mm_processor_kwargs": {"enable_thinking": True},
         }
-
-        if thinking:
-            payload["mm_processor_kwargs"] = {"enable_thinking": True}
 
         try:
             response = self.client.post(

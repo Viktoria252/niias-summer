@@ -1,3 +1,5 @@
+version: '3.8'
+
 services:
   # 1. СУБД PostgreSQL
   postgres:
@@ -13,26 +15,77 @@ services:
       - postgres_data_v2:/var/lib/postgresql/data
     networks:
       - locomotive_network
+    restart: unless-stopped
 
   # 2. Бэкенд-оркестратор (Spring Boot)
   backend:
     build:
-      context: ./backend # Путь к папке, где лежит Dockerfile бэкенда
+      context: ./backend # Путь к подпапке с бэкендом
       dockerfile: Dockerfile
     container_name: locomotive_backend
     ports:
       - "8080:8080"
     environment:
-      # Переопределяем адрес СУБД для работы внутри Docker-сети.
+      # Переопределяем адрес СУБД для работы внутри Docker-сети
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/locomotive_db
       # Выключаем встроенную поддержку Compose, так как мы уже запущены внутри Docker
       SPRING_DOCKER_COMPOSE_ENABLED: "false"
-      # Пока тестируем на заглушках, держим true
+      # Пока тестируем на заглушках, держим true. Для работы с реальной моделью переключим в false.
       APP_ML_MOCK_ENABLED: "true"
+      # Адрес FastAPI-сервиса во внутренней сети Docker
+      APP_ML_SERVICE_URL: "http://fastapi:8001" 
     depends_on:
-      - postgres # Бэкенд запустится только после успешного старта СУБД
+      - postgres
     networks:
       - locomotive_network
+    restart: unless-stopped
+
+  # 3. vLLM-сервер (ИИ-движок)
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-server
+    command: >
+      serve baidu/Qianfan-OCR
+      --trust-remote-code
+      --hf-overrides '{"architectures": ["InternVLChatModel"]}'
+      --host 0.0.0.0
+      --port 8000
+    ports:
+      - "8000:8000"
+    # При деплое на CPU-сервер блок deploy и переменные ниже нужно будет удалить
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    networks:
+      - locomotive_network
+    restart: unless-stopped
+
+  # 4. FastAPI-сервер (Аналитический модуль)
+  fastapi:
+    build:
+      context: ./ml_service
+      dockerfile: Dockerfile.fastapi
+    container_name: fastapi-server
+    ports:
+      - "8001:8001"
+    environment:
+      - VLLM_URL=http://vllm:8000
+      - MODEL_NAME=baidu/Qianfan-OCR
+      - VLLM_TIMEOUT=120
+      - ENABLE_THINKING=true
+    depends_on:
+      - vllm
+    networks:
+      - locomotive_network
+    restart: unless-stopped
 
 volumes:
   postgres_data_v2:

@@ -1,0 +1,47 @@
+spring:
+  application:
+    name: locomotive-orchestrator
+
+  # 1. Включение виртуальных потоков Java 21 для масштабируемости
+  threads:
+    virtual:
+      enabled: true
+
+  # 2. Подключение к базе данных PostgreSQL (при запуске из IDE)
+  datasource:
+    url: jdbc:postgresql://localhost:5432/locomotive_db
+    username: dev_user
+    password: dev_password
+    driver-class-name: org.postgresql.Driver
+
+  # 3. Настройки Hibernate / JPA
+  jpa:
+    hibernate:
+      # Спринг проверяет схему на соответствие. Таблицы создает Flyway
+      ddl-auto: validate
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+  # 4. Автоматическое управление БД во время локальной разработки в IDE
+  docker:
+    compose:
+      enabled: true
+      # Указываем путь к compose.yaml, лежащему на уровень выше в корне проекта
+      file: ../compose.yaml
+
+  # 5. Настройки миграций Flyway
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+
+# 6. Бизнес-параметры интеграции с ML-сервисом (FastAPI)
+app:
+  # URL по которому будет доступен FastAPI-сервис
+  ml-service-url: http://localhost:8000
+  # Переключатель режима:
+  # true  - фоновая симуляция на новых точных заглушках
+  # false - реальная отправка бинарных файлов в FastAPI
+  ml-mock-enabled: true

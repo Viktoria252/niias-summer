@@ -1,0 +1,42 @@
+services:
+  # 1. СУБД PostgreSQL
+  postgres:
+    image: postgres:16-alpine
+    container_name: locomotive_postgres
+    environment:
+      POSTGRES_DB: locomotive_db
+      POSTGRES_USER: dev_user
+      POSTGRES_PASSWORD: dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data_v2:/var/lib/postgresql/data
+    networks:
+      - locomotive_network
+
+  # 2. Бэкенд-оркестратор (Spring Boot)
+  backend:
+    build:
+      context: ./backend # Путь к папке, где лежит Dockerfile бэкенда
+      dockerfile: Dockerfile
+    container_name: locomotive_backend
+    ports:
+      - "8080:8080"
+    environment:
+      # Переопределяем адрес СУБД для работы внутри Docker-сети.
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/locomotive_db
+      # Выключаем встроенную поддержку Compose, так как мы уже запущены внутри Docker
+      SPRING_DOCKER_COMPOSE_ENABLED: "false"
+      # Пока тестируем на заглушках, держим true
+      APP_ML_MOCK_ENABLED: "true"
+    depends_on:
+      - postgres # Бэкенд запустится только после успешного старта СУБД
+    networks:
+      - locomotive_network
+
+volumes:
+  postgres_data_v2:
+
+networks:
+  locomotive_network:
+    driver: bridge

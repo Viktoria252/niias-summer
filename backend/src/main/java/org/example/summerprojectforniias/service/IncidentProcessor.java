@@ -28,21 +28,22 @@ public class IncidentProcessor {
     private final MlIntegrationService mlIntegrationService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-
-    //ЗНАЧЕНИЕ true - режим симуляции
-    //ЗНАЧЕНИЕ false - боевой режим для прода
-    @Value("${app.ml-mock-enabled:false}")
+    // По умолчанию ставим true, чтобы локальный запуск работал на заглушках
+    // и не падал с ошибкой связи, если FastAPI сервер отключен.
+    @Value("${app.ml-mock-enabled:true}")
     private boolean mlMockEnabled;
 
-    @Async
+    @Async // Метод гарантированно выполняется в фоновом потоке
     public void processIncidentAsync(UUID incidentId) {
         log.info("Начата фоновая обработка инцидента {}", incidentId);
         try {
+            // 1. Переводим инцидент в статус PROCESSING
             updateIncidentStatus(incidentId, IncidentStatus.PROCESSING);
             sseService.sendStatusUpdate(incidentId, new IncidentStatusUpdate(
                     incidentId, IncidentStatus.PROCESSING, null, false, null
             ));
 
+            // 2. Достаем все документы инцидента для последовательной обработки (экономит ОЗУ)
             List<Document> documents = documentRepository.findAll().stream()
                     .filter(doc -> doc.getIncident().getId().equals(incidentId))
                     .toList();
@@ -56,9 +57,9 @@ public class IncidentProcessor {
                 MlResultDto mlResult;
 
                 if (mlMockEnabled) {
-                    Thread.sleep(3000);
+                    Thread.sleep(3000); // Имитируем работу ML на CPU
 
-                    // Обновленный Mock под новый точный формат Виктории
+                    // Тестовый Mock под новый точный формат Qwen от Виктории
                     ProtocolDataDto mockProtocol = new ProtocolDataDto(
                             "перегон Хижина-Магазин",
                             "2026-01-01",
@@ -73,32 +74,32 @@ public class IncidentProcessor {
                     );
                     mlResult = new MlResultDto("# Локальный OCR текст...", mockProtocol, "8f3c3c3c1c1c1c1c");
                 } else {
-                    // РЕАЛЬНЫЙ вызов FastAPI через HTTP-клиент
+                    // РЕАЛЬНЫЙ отправка файла в FastAPI по HTTP
                     mlResult = mlIntegrationService.extractData(doc.getFileData(), doc.getFileName());
                 }
 
-                // Проверяем p_hash на дубликаты за последние 30 дней
+                // Проверяем p_hash на дубликаты за последние 30 дней по расстоянию Хэмминга
                 boolean isDuplicate = documentRepository.existsDuplicateInLast30Days(mlResult.p_hash());
                 if (isDuplicate) {
                     anyDocumentIsDuplicate = true;
                     log.warn("Документ {} заподозрен в дублировании! pHash: {}", doc.getId(), mlResult.p_hash());
                 }
 
-                // Сливаем данные текущего документа в общий отчет
+                // Сливаем данные текущего документа в общий отчет инцидента
                 finalMergedData = mergeProtocolData(finalMergedData, mlResult.parsed_json());
 
-                // Записываем результаты в БД
+                // Записываем результаты обработки конкретного документа в БД
                 String parsedJsonStr = objectMapper.writeValueAsString(mlResult.parsed_json());
                 updateDocumentResults(doc.getId(), DocumentStatus.PARSED,
                         mlResult.extracted_text(), parsedJsonStr,
                         mlResult.p_hash(), isDuplicate);
             }
 
-            // Записываем финальные слитые данные и закрываем инцидент
+            // 3. Сохраняем объединенные данные и закрываем инцидент (COMPLETED)
             String finalMergedDataStr = objectMapper.writeValueAsString(finalMergedData);
             updateIncidentDataAndStatus(incidentId, IncidentStatus.COMPLETED, finalMergedDataStr);
 
-            // Отправляем финальное уведомление через SSE
+            // Отправляем финальный JSON-отчет клиенту через SSE
             sseService.sendStatusUpdate(incidentId, new IncidentStatusUpdate(
                     incidentId, IncidentStatus.COMPLETED, finalMergedDataStr, anyDocumentIsDuplicate, null
             ));
@@ -166,7 +167,7 @@ public class IncidentProcessor {
         if (source == null) return target;
         if (target == null) return source;
 
-        // Логика слияния
+        // Чистая логика слияния плоских полей спецификации НИИАС
         return new ProtocolDataDto(
                 source.failureLocation() != null ? source.failureLocation() : target.failureLocation(),
                 source.failureDate() != null ? source.failureDate() : target.failureDate(),

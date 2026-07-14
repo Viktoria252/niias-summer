@@ -21,7 +21,7 @@ public class IncidentService {
 
     private final IncidentRepository incidentRepository;
     private final DocumentRepository documentRepository;
-    private final IncidentProcessor incidentProcessor; // Внедряем наш новый асинхронный процессор
+    private final IncidentProcessor incidentProcessor;
 
     @Transactional
     public IncidentUploadResponse uploadIncidents(MultipartFile[] files) throws IOException {
@@ -59,5 +59,14 @@ public class IncidentService {
                 .orElseThrow(() -> new IllegalArgumentException("Инцидент не найден"));
         incident.setCorrectedData(correctedData);
         incidentRepository.save(incident);
+    }
+    @Transactional(readOnly = true)
+    public Incident getIncident(UUID id) {
+        return incidentRepository.findById(id).orElse(null);
+    }
+
+    @Transactional(readOnly = true)
+    public Document getDocument(UUID docId) {
+        return documentRepository.findById(docId).orElse(null);
     }
 }

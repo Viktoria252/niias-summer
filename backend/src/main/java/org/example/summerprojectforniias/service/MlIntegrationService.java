@@ -29,7 +29,7 @@ public class MlIntegrationService {
 
         // POST запрос к FastAPI (/api/v1/extract) формата multipart/form-data
         return mlRestClient.post()
-                .uri("/api/v1/extract")
+                .uri("/ocr")
                 .contentType(MediaType.MULTIPART_FORM_DATA)
                 .body(body)
                 .retrieve()

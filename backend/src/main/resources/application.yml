@@ -40,7 +40,7 @@ spring:
 # 6. Бизнес-параметры интеграции с ML-сервисом (FastAPI)
 app:
   # URL по которому будет доступен FastAPI-сервис
-  ml-service-url: http://localhost:8000
+  ml-service-url: http://localhost:8001
   # Переключатель режима:
   # true  - фоновая симуляция на новых точных заглушках
   # false - реальная отправка бинарных файлов в FastAPI

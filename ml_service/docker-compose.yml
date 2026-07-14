@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-server
+    command: >
+      serve baidu/Qianfan-OCR
+      --trust-remote-code
+      --hf-overrides '{"architectures": ["InternVLChatModel"]}'
+      --host 0.0.0.0
+      --port 8000
+    ports:
+      - "8000:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    restart: unless-stopped
+
+  fastapi:
+    build:
+      context: .
+      dockerfile: Dockerfile.fastapi
+    container_name: fastapi-server
+    ports:
+      - "8001:8001"
+    environment:
+      - VLLM_URL=http://vllm:8000
+      - MODEL_NAME=baidu/Qianfan-OCR
+      - VLLM_TIMEOUT=120
+      - ENABLE_THINKING=true
+    depends_on:
+      - vllm
+    restart: unless-stopped

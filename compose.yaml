@@ -62,14 +62,17 @@ services:
   # 4. FastAPI-сервер (Аналитический модуль)
   fastapi:
     build:
-      context: .
+      context: ./ml_service
       dockerfile: Dockerfile.fastapi
     container_name: fastapi-server
     ports:
       - "8001:8001"
     environment:
       - MODEL_NAME=baidu/Qianfan-OCR
+      - MOCK_MODE=true 
       - CUDA_VISIBLE_DEVICES=0   # если нужна GPU
+    networks:
+      - locomotive_network
     deploy:
       resources:
         reservations:

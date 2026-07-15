@@ -1,20 +1,25 @@
 FROM python:3.11-slim
 
-# Системные зависимости: poppler для pdf2image, libreoffice для конвертации DOC/DOCX
+# Системные зависимости
 RUN apt-get update && apt-get install -y \
     poppler-utils \
     libreoffice \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Копируем зависимости и устанавливаем
+# Шаг 1. Клонируем репозиторий с кодом модели на этапе сборки образа
+RUN git clone -b develop --single-branch https://github.com/baidubce/skills.git /tmp/skills && \
+    cp -r /tmp/skills/skills/qianfanocr-document-intelligence/* /app/ && \
+    rm -rf /tmp/skills
+
+# Шаг 2. Устанавливаем зависимости
 COPY requirements.txt .
-# Для CPU-сборки PyTorch используем pip install torch --index-url https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir torch==2.4.0 --index-url https://download.pytorch.org/whl/cpu && \
+RUN pip install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir -r requirements.txt
 
-# Копируем исходники
+# Шаг 3. Копируем исходный код нашего приложения (файлы приложения перезапишут только себя)
 COPY . .
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001"]

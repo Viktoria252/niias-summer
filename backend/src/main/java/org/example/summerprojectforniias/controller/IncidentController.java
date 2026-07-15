@@ -1,16 +1,17 @@
 package org.example.summerprojectforniias.controller;
 
 import lombok.RequiredArgsConstructor;
+import org.example.summerprojectforniias.dto.IncidentUploadResponse;
+import org.example.summerprojectforniias.model.Document;
+import org.example.summerprojectforniias.model.Incident;
+import org.example.summerprojectforniias.service.IncidentProcessor; // Добавлен импорт
+import org.example.summerprojectforniias.service.IncidentService;
+import org.example.summerprojectforniias.service.SseService;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
-import org.example.summerprojectforniias.dto.IncidentUploadResponse;
-import org.example.summerprojectforniias.service.IncidentService;
-import org.example.summerprojectforniias.service.SseService;
-import org.example.summerprojectforniias.model.Incident;
-import org.example.summerprojectforniias.model.Document;
 
 import java.io.IOException;
 import java.util.List;
@@ -19,18 +20,26 @@ import java.util.UUID;
 @RestController
 @RequestMapping("/api/v1/incidents")
 @RequiredArgsConstructor
-@CrossOrigin(origins = "*") // Разрешаем запросы с любого порта
+@CrossOrigin(origins = "*")
 public class IncidentController {
 
     private final IncidentService incidentService;
     private final SseService sseService;
+    private final IncidentProcessor incidentProcessor; // Внедряем асинхронный процессор
 
-    // 1. Загрузка файлов
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<IncidentUploadResponse> uploadIncidents(
             @RequestParam("files") MultipartFile[] files) throws IOException {
 
-        IncidentUploadResponse response = incidentService.uploadIncidents(files);
+        // Генерируем UUID прямо здесь, чтобы он был доступен обоим бинам
+        UUID incidentId = UUID.randomUUID();
+
+        // Передаем сгенерированный ID в метод сервиса
+        IncidentUploadResponse response = incidentService.uploadIncidents(incidentId, files);
+
+        // Запускаем фоновую обработку
+        incidentProcessor.processIncidentAsync(incidentId);
+
         return ResponseEntity.ok(response);
     }
 
@@ -50,7 +59,7 @@ public class IncidentController {
         return ResponseEntity.ok().build();
     }
 
-    // 4. Получение истории инцидента по ID (если пользователь обновил страницу)
+    // 4. Получение истории инцидента по ID
     @GetMapping("/{id}")
     public ResponseEntity<Incident> getIncident(@PathVariable UUID id) {
         Incident incident = incidentService.getIncident(id);
@@ -60,7 +69,7 @@ public class IncidentController {
         return ResponseEntity.ok(incident);
     }
 
-    // 5. Просмотр оригинального файла документа из базы данных (для рендеринга картинок на фронте)
+    // 5. Просмотр оригинального файла документа
     @GetMapping(value = "/documents/{docId}/file", produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
     public ResponseEntity<byte[]> getDocumentFile(@PathVariable UUID docId) {
         Document doc = incidentService.getDocument(docId);
@@ -71,10 +80,11 @@ public class IncidentController {
                 .header("Content-Disposition", "attachment; filename=\"" + doc.getFileName() + "\"")
                 .body(doc.getFileData());
     }
+
     // 6. Получение списка всех инцидентов для реестра
     @GetMapping
     public ResponseEntity<List<Incident>> getAllIncidents() {
-        List<Incident> incidents = incidentService.getAllIncidents(); // Предполагаем, что этот метод есть в сервисе
+        List<Incident> incidents = incidentService.getAllIncidents();
         return ResponseEntity.ok(incidents);
     }
 
@@ -84,7 +94,26 @@ public class IncidentController {
             @PathVariable UUID id,
             @RequestParam("files") MultipartFile[] files) throws IOException {
 
-        incidentService.addDocumentsToIncident(id, files); // Метод в сервисе для привязки к существующему ID
+        // Фиксируем транзакцию добавления файлов в сервисном слое
+        incidentService.addDocumentsToIncident(id, files);
+
+        // Запускаем асинхронный процессор повторно
+        incidentProcessor.processIncidentAsync(id);
+
+        return ResponseEntity.ok().build();
+    }
+
+    // 8. Удаление инцидента и всех связанных документов
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> deleteIncident(@PathVariable UUID id) {
+        incidentService.deleteIncident(id);
+        return ResponseEntity.ok().build();
+    }
+
+    // 9. Удаление конкретного документа из инцидента с пересчетом данных
+    @DeleteMapping("/documents/{docId}")
+    public ResponseEntity<Void> deleteDocument(@PathVariable UUID docId) {
+        incidentService.deleteDocument(docId);
         return ResponseEntity.ok().build();
     }
 }

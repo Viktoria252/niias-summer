@@ -4,10 +4,10 @@ import lombok.RequiredArgsConstructor;
 import org.example.summerprojectforniias.dto.MlResultDto;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
-import org.springframework.http.client.MultipartBodyBuilder;
 import org.springframework.stereotype.Service;
-import org.springframework.util.MultiValueMap;
+import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.web.client.RestClient;
 
 @Service
@@ -17,18 +17,27 @@ public class MlIntegrationService {
     private final RestClient mlRestClient;
 
     public MlResultDto extractData(byte[] fileData, String fileName) {
-        ByteArrayResource fileResource = new ByteArrayResource(fileData);
+        // 1. Создаем ресурс файла с переопределенным именем
+        ByteArrayResource fileResource = new ByteArrayResource(fileData) {
+            @Override
+            public String getFilename() {
+                return fileName;
+            }
+        };
 
-        MultipartBodyBuilder builder = new MultipartBodyBuilder();
+        // 2. Явно настраиваем заголовки для части запроса с файлом
+        HttpHeaders partHeaders = new HttpHeaders();
+        partHeaders.setContentType(MediaType.APPLICATION_OCTET_STREAM);
+        HttpEntity<ByteArrayResource> fileEntity = new HttpEntity<>(fileResource, partHeaders);
 
-        builder.part("file", fileResource)
-                .filename(fileName)
-                .contentType(MediaType.APPLICATION_OCTET_STREAM);
+        // 3. Используем классический LinkedMultiValueMap (самый стабильный способ в истории Spring)
+        LinkedMultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+        body.add("file", fileEntity);
 
-        MultiValueMap<String, HttpEntity<?>> body = builder.build();
-
+        // 4. Отправляем строго как MULTIPART_FORM_DATA
         return mlRestClient.post()
                 .uri("/ocr")
+                .contentType(MediaType.MULTIPART_FORM_DATA)
                 .body(body)
                 .retrieve()
                 .body(MlResultDto.class);

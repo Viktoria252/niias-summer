@@ -184,6 +184,7 @@ function IncidentWorkspace() {
   const [errorMessage, setErrorMessage] = useState("");
   const [isDuplicate, setIsDuplicate] = useState(false);
   const [isDragging, setIsDragging] = useState(false); // Для визуального отклика Drag-and-Drop
+  const [showDupDetails, setShowDupDetails] = useState(false); // Для разворачивания плашки дубликатов
   
   const [actionLoading, setActionLoading] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
@@ -203,7 +204,19 @@ function IncidentWorkspace() {
       setErrorMessage(data.errorMessage || "");
       setUploadedDocs(data.documents || []);
 
-      const fieldsSource = data.correctedData || data.mergedData || {};
+      // --- БЕЗОПАСНЫЙ ПАРСИНГ СТРОК ИЗ СУБД В JS-ОБЪЕКТЫ ---
+      let fieldsSource = {};
+      
+      if (data.correctedData) {
+        fieldsSource = typeof data.correctedData === "string" 
+          ? JSON.parse(data.correctedData) 
+          : data.correctedData;
+      } else if (data.mergedData) {
+        fieldsSource = typeof data.mergedData === "string" 
+          ? JSON.parse(data.mergedData) 
+          : data.mergedData;
+      }
+
       setFormData((prev) => {
         const updated = { ...prev };
         DEFAULT_FIELDS.forEach((field) => {
@@ -238,21 +251,25 @@ function IncidentWorkspace() {
           if (payload.errorMessage) setErrorMessage(payload.errorMessage);
           if (payload.isSuspectedDuplicate !== undefined) setIsDuplicate(payload.isSuspectedDuplicate);
 
-          if (payload.status === "COMPLETED") {
-            const finalFields = payload.mergedData || {};
+          // НА ЛЕТУ автозаполняем поля формы при любом промежуточном или финальном обновлении данных
+          if (payload.mergedData) {
+            const currentFields = typeof payload.mergedData === "string" 
+              ? JSON.parse(payload.mergedData) 
+              : payload.mergedData;
+              
             setFormData((prev) => {
               const updated = { ...prev };
               DEFAULT_FIELDS.forEach((f) => {
-                if (finalFields[f] !== undefined) updated[f] = String(finalFields[f]);
+                if (currentFields[f] !== undefined) updated[f] = String(currentFields[f]);
               });
               return updated;
             });
-            loadIncident();
-            eventSource.close();
-            sseConnected.current = false;
           }
 
-          if (payload.status === "FAILED") {
+          // Всегда перезагружаем данные, чтобы обновить списки документов (их статусы изменятся на PARSED)
+          loadIncident();
+
+          if (payload.status === "COMPLETED" || payload.status === "FAILED") {
             eventSource.close();
             sseConnected.current = false;
           }
@@ -302,11 +319,30 @@ function IncidentWorkspace() {
     }
   };
 
+  // Удаление конкретного документа из инцидента
+  const handleDeleteDocument = async (docId, fileName, e) => {
+    e.preventDefault();
+    if (!window.confirm(`Вы действительно хотите удалить файл "${fileName}"? Это пересчитает параметры отказа.`)) {
+      return;
+    }
+    try {
+      const response = await fetch(`/api/v1/incidents/documents/${docId}`, {
+        method: "DELETE",
+      });
+      if (!response.ok) {
+        throw new Error("Не удалось удалить документ.");
+      }
+      alert("Документ успешно удален!");
+      loadIncident(); // Перезагружаем форму и файлы
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
   // Обработка ручного выбора файлов (через клик)
   const handleFileChange = (e) => {
     if (e.target.files) {
       const selectedFiles = Array.from(e.target.files);
-      // Добавляем к уже выбранным (позволяет выбирать файлы за несколько раз)
       setFiles((prev) => [...prev, ...selectedFiles]);
     }
   };
@@ -316,6 +352,7 @@ function IncidentWorkspace() {
     e.preventDefault();
   };
 
+  // Обработчики Drag-and-Drop
   const handleDragEnter = (e) => {
     e.preventDefault();
     setIsDragging(true);
@@ -331,7 +368,6 @@ function IncidentWorkspace() {
     setIsDragging(false);
     if (e.dataTransfer.files) {
       const droppedFiles = Array.from(e.dataTransfer.files);
-      // Накапливаем файлы, поддерживая множественный сброс за раз
       setFiles((prev) => [...prev, ...droppedFiles]);
     }
   };
@@ -403,6 +439,10 @@ function IncidentWorkspace() {
     }
   };
 
+  // Разделяем документы на обработанные и находящиеся в обработке
+  const processedDocs = uploadedDocs.filter((doc) => doc.status === "PARSED");
+  const processingDocs = uploadedDocs.filter((doc) => doc.status === "NEW" || doc.status === "PROCESSING");
+
   return (
     <div className="workspace-container">
       <div className="navigation-row">
@@ -453,9 +493,37 @@ function IncidentWorkspace() {
             <p className="block-subtitle">Оригиналы документов и статус распознавания</p>
           </div>
 
+          {/* Плашка обнаружения дубликатов (С выпадающим списком деталей) */}
           {isDuplicate && (
-            <div className="alert-duplicate">
-              ⚠️ <strong>Внимание:</strong> Обнаружен файл с идентичным визуальным хэшем (pHash). Возможен дубликат.
+            <div className="alert-duplicate-box" style={{ background: "#fff3cd", border: "1px solid #ffeeba", borderRadius: "6px", padding: "15px", marginBottom: "15px", color: "#856404" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  ⚠️ <strong>Внимание:</strong> Обнаружен файл с идентичным визуальным хэшем (pHash). Возможен дубликат!
+                </div>
+                <button 
+                  onClick={() => setShowDupDetails(!showDupDetails)} 
+                  className="btn-secondary" 
+                  style={{ height: "30px", fontSize: "12px", padding: "0 10px", margin: 0, background: "#856404", color: "#fff", border: "none", cursor: "pointer" }}
+                >
+                  {showDupDetails ? "Свернуть" : "Детали"}
+                </button>
+              </div>
+              
+              {showDupDetails && (
+                <div className="dup-details-content" style={{ marginTop: "10px", borderTop: "1px solid #ffeeba", paddingTop: "10px" }}>
+                  <p style={{ fontSize: "12px", fontWeight: "bold", marginBottom: "5px" }}>Найденные совпадения в системе:</p>
+                  <ul style={{ margin: 0, paddingLeft: "20px" }}>
+                    {uploadedDocs
+                      .filter(doc => doc.isSuspectedDuplicate && doc.extractedText)
+                      .map(doc => (
+                        <li key={doc.id} style={{ fontSize: "12px", marginTop: "5px", color: "#664d03", lineHeight: "1.4" }}>
+                          <strong>{doc.fileName}:</strong> {doc.extractedText}
+                        </li>
+                      ))
+                    }
+                  </ul>
+                </div>
+              )}
             </div>
           )}
 
@@ -482,23 +550,59 @@ function IncidentWorkspace() {
             </div>
           )}
 
-          {/* Б. Список ранее прикрепленных файлов (для существующих инцидентов) */}
-          {!isNew && uploadedDocs.length > 0 && (
-            <div className="docs-list-section">
-              <h4>Уже обработанные документы ({uploadedDocs.length}):</h4>
+          {/* Б1. Список файлов В ОБРАБОТКЕ */}
+          {!isNew && processingDocs.length > 0 && (
+            <div className="docs-list-section" style={{ borderLeft: "4px solid #ff9800", paddingLeft: "10px", marginBottom: "15px" }}>
+              <h4 style={{ color: "#e65100" }}>Файлы в обработке ({processingDocs.length}):</h4>
               <div className="uploaded-docs-grid">
-                {uploadedDocs.map((doc) => (
+                {processingDocs.map((doc) => (
+                  <div key={doc.id} className="uploaded-doc-row processing-doc-row">
+                    <span className="doc-icon-mini spinner-icon">⏳</span>
+                    <span className="doc-name-text" title={doc.fileName}>{doc.fileName}</span>
+                    <div className="doc-action-group">
+                      <span className="text-loading-status">распознавание...</span>
+                      <button
+                        onClick={(e) => handleDeleteDocument(doc.id, doc.fileName, e)}
+                        className="btn-doc-delete"
+                        title="Удалить файл из обработки"
+                        style={{ marginLeft: "10px", background: "none", border: "none", color: "#f44336", cursor: "pointer", fontSize: "14px" }}
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Б2. Список ранее прикрепленных и УСПЕШНО ОБРАБОТАННЫХ файлов */}
+          {!isNew && processedDocs.length > 0 && (
+            <div className="docs-list-section">
+              <h4>Уже обработанные документы ({processedDocs.length}):</h4>
+              <div className="uploaded-docs-grid">
+                {processedDocs.map((doc) => (
                   <div key={doc.id} className="uploaded-doc-row">
                     <span className="doc-icon-mini">📄</span>
                     <span className="doc-name-text" title={doc.fileName}>{doc.fileName}</span>
-                    <a
-                      href={`/api/v1/incidents/documents/${doc.id}/file`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="btn-doc-open"
-                    >
-                      Открыть
-                    </a>
+                    <div className="doc-action-group" style={{ display: "flex", alignItems: "center" }}>
+                      <a
+                        href={`/api/v1/incidents/documents/${doc.id}/file`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="btn-doc-open"
+                      >
+                        Открыть
+                      </a>
+                      <button
+                        onClick={(e) => handleDeleteDocument(doc.id, doc.fileName, e)}
+                        className="btn-doc-delete"
+                        title="Удалить документ"
+                        style={{ marginLeft: "10px", background: "none", border: "none", color: "#f44336", cursor: "pointer", fontSize: "14px" }}
+                      >
+                        ✕
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>

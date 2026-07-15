@@ -14,6 +14,7 @@ import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.UUID;
 
@@ -28,12 +29,10 @@ public class IncidentProcessor {
     private final MlIntegrationService mlIntegrationService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
-    // По умолчанию ставим true, чтобы локальный запуск работал на заглушках
-    // и не падал с ошибкой связи, если FastAPI сервер отключен.
     @Value("${app.ml-mock-enabled:true}")
     private boolean mlMockEnabled;
 
-    @Async // Метод гарантированно выполняется в фоновом потоке
+    @Async
     public void processIncidentAsync(UUID incidentId) {
         log.info("Начата фоновая обработка инцидента {}", incidentId);
         try {
@@ -43,15 +42,37 @@ public class IncidentProcessor {
                     incidentId, IncidentStatus.PROCESSING, null, false, null
             ));
 
-            // 2. Достаем все документы инцидента для последовательной обработки (экономит ОЗУ)
-            List<Document> documents = documentRepository.findAll().stream()
-                    .filter(doc -> doc.getIncident().getId().equals(incidentId))
-                    .toList();
+            // 2. Быстро достаем список документов инцидента напрямую из БД (без Lazy-проблем)
+            Incident incident = incidentRepository.findById(incidentId)
+                    .orElseThrow(() -> new IllegalArgumentException("Инцидент не найден: " + incidentId));
+            List<Document> documents = documentRepository.findAllByIncidentId(incidentId);
 
             boolean anyDocumentIsDuplicate = false;
+            
+            // Инициализируем finalMergedData уже существующими сводными данными инцидента,
+            // чтобы новые дозагруженные файлы дополняли отчет, а не затирали старые поля!
             ProtocolDataDto finalMergedData = null;
+            if (incident.getMergedData() != null) {
+                try {
+                    finalMergedData = objectMapper.readValue(incident.getMergedData(), ProtocolDataDto.class);
+                    log.info("Инициализированы существующие данные для слияния: {}", incident.getMergedData());
+                } catch (Exception e) {
+                    log.warn("Не удалось распарсить существующий mergedData: {}", e.getMessage());
+                }
+            }
 
             for (Document doc : documents) {
+                // КРИТИЧЕСКИ ВАЖНО: Пропускаем документы, которые уже были успешно обработаны ранее!
+                if (doc.getStatus() == DocumentStatus.PARSED) {
+                    log.info("Документ {} уже обработан ранее, пропускаем его повторный анализ.", doc.getFileName());
+                    
+                    // Если старый файл был помечен как дубликат, сохраняем этот флаг для общего отчета
+                    if (Boolean.TRUE.equals(doc.getIsSuspectedDuplicate())) {
+                        anyDocumentIsDuplicate = true;
+                    }
+                    continue; 
+                }
+
                 updateDocumentStatus(doc.getId(), DocumentStatus.PROCESSING);
 
                 MlResultDto mlResult;
@@ -59,30 +80,58 @@ public class IncidentProcessor {
                 if (mlMockEnabled) {
                     Thread.sleep(3000); // Имитируем работу ML на CPU
 
-                    // Тестовый Mock под новый точный формат Qwen от Виктории
                     ProtocolDataDto mockProtocol = new ProtocolDataDto(
-                            "перегон Хижина-Магазин",
+                            "1",
                             "2026-01-01",
                             "null",
-                            "ТЭМ18Д",
+                            "1",
                             "№1111",
-                            "№999 от 01.01.2014",
-                            "неисправность турбины ТК-30 (посторонний шум при работе)",
-                            "производственный",
-                            "локомотив ТЭМ18Д №1111",
-                            "«ЛокоТех Сервис»"
+                            "1",
+                            "1",
+                            "1",
+                            "л111",
+                            "1"
                     );
                     mlResult = new MlResultDto("# Локальный OCR текст...", mockProtocol, "8f3c3c3c1c1c1c1c");
                 } else {
-                    // РЕАЛЬНЫЙ отправка файла в FastAPI по HTTP
                     mlResult = mlIntegrationService.extractData(doc.getFileData(), doc.getFileName());
                 }
 
-                // Проверяем p_hash на дубликаты за последние 30 дней по расстоянию Хэмминга
-                boolean isDuplicate = documentRepository.existsDuplicateInLast30Days(mlResult.p_hash());
+                // Надежный побитовый расчет Хэмминга на стороне Java (100% точность)
+                // 3. Надежный побитовый расчет Хэмминга на стороне Java с выявлением оригинала
+                boolean isDuplicate = false;
+                String newHash = mlResult.p_hash();
+                String dupDetails = null;
+                
+                if (newHash != null) {
+                    LocalDateTime thirtyDaysAgo = LocalDateTime.now().minusDays(30);
+                    List<Document> existingDocs = documentRepository.findDocumentsSince(thirtyDaysAgo);
+                    
+                    for (Document oldDoc : existingDocs) {
+                        // Исключаем сравнение со своим же прошлым хэшем, если документ перерабатывается заново
+                        if (oldDoc.getId().equals(doc.getId())) {
+                            continue;
+                        }
+                        
+                        String oldHash = oldDoc.getPHash();
+                        int distance = calculateHammingDistance(newHash, oldHash);
+                        if (distance < 8) {
+                            isDuplicate = true;
+                            // Генерируем детальное описание дубликата
+                            dupDetails = String.format(
+                                "Текущий файл совпадает с ранее загруженным файлом '%s' в рамках Инцидента (ID: %s), который был добавлен %s.",
+                                oldDoc.getFileName(),
+                                oldDoc.getIncident().getId(),
+                                oldDoc.getCreatedAt().toString().replace("T", " в ").substring(0, 21)
+                            );
+                            log.warn("Документ {} заподозрен в дублировании! {}", doc.getId(), dupDetails);
+                            break;
+                        }
+                    }
+                }
+
                 if (isDuplicate) {
                     anyDocumentIsDuplicate = true;
-                    log.warn("Документ {} заподозрен в дублировании! pHash: {}", doc.getId(), mlResult.p_hash());
                 }
 
                 // Сливаем данные текущего документа в общий отчет инцидента
@@ -90,12 +139,24 @@ public class IncidentProcessor {
 
                 // Записываем результаты обработки конкретного документа в БД
                 String parsedJsonStr = objectMapper.writeValueAsString(mlResult.parsed_json());
+                
+                // Если найден дубликат, записываем его детали в extracted_text вместо OCR
+                String finalExtractedText = isDuplicate ? dupDetails : mlResult.extracted_text();
+                
                 updateDocumentResults(doc.getId(), DocumentStatus.PARSED,
-                        mlResult.extracted_text(), parsedJsonStr,
+                        finalExtractedText, parsedJsonStr,
                         mlResult.p_hash(), isDuplicate);
+
+                // Отправляем промежуточные результаты на фронтенд "на лету" для автозаполнения полей формы
+                String currentMergedDataStr = objectMapper.writeValueAsString(finalMergedData);
+                updateIncidentDataAndStatus(incidentId, IncidentStatus.PROCESSING, currentMergedDataStr);
+                
+                sseService.sendStatusUpdate(incidentId, new IncidentStatusUpdate(
+                        incidentId, IncidentStatus.PROCESSING, currentMergedDataStr, anyDocumentIsDuplicate, null
+                ));
             }
 
-            // 3. Сохраняем объединенные данные и закрываем инцидент (COMPLETED)
+            // 3. Сохраняем итоговые объединенные данные и закрываем инцидент (COMPLETED)
             String finalMergedDataStr = objectMapper.writeValueAsString(finalMergedData);
             updateIncidentDataAndStatus(incidentId, IncidentStatus.COMPLETED, finalMergedDataStr);
 
@@ -114,6 +175,16 @@ public class IncidentProcessor {
                     incidentId, IncidentStatus.FAILED, null, false, e.getMessage()
             ));
             sseService.completeEmitter(incidentId);
+        }
+    }
+
+    private int calculateHammingDistance(String hash1, String hash2) {
+        try {
+            long h1 = Long.parseUnsignedLong(hash1, 16);
+            long h2 = Long.parseUnsignedLong(hash2, 16);
+            return Long.bitCount(h1 ^ h2);
+        } catch (NumberFormatException e) {
+            return 64;
         }
     }
 
@@ -167,7 +238,6 @@ public class IncidentProcessor {
         if (source == null) return target;
         if (target == null) return source;
 
-        // Чистая логика слияния плоских полей спецификации НИИАС
         return new ProtocolDataDto(
                 source.failureLocation() != null ? source.failureLocation() : target.failureLocation(),
                 source.failureDate() != null ? source.failureDate() : target.failureDate(),

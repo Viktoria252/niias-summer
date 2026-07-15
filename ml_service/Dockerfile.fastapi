@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Установка системных зависимостей для pdf2image и LibreOffice
+# Системные зависимости: poppler для pdf2image, libreoffice для конвертации DOC/DOCX
 RUN apt-get update && apt-get install -y \
     poppler-utils \
     libreoffice \
@@ -8,9 +8,13 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
+# Копируем зависимости и устанавливаем
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Для CPU-сборки PyTorch используем pip install torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir torch==2.4.0 --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir -r requirements.txt
 
+# Копируем исходники
 COPY . .
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]

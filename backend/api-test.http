@@ -1,0 +1,33 @@
+### 1. Загрузка файла (Создание инцидента)
+POST http://localhost:8080/api/v1/incidents
+Content-Type: multipart/form-data; boundary=WebAppBoundary
+
+--WebAppBoundary
+Content-Disposition: form-data; name="files"; filename="locomotive_report.pdf"
+Content-Type: application/pdf
+
+< ./src/main/resources/application.yml
+--WebAppBoundary--
+
+> {%
+    // Скрипт-обработчик ответа:
+    // Извлекаем "incidentId" из JSON-ответа и сохраняем его в глобальную переменную "incident_id"
+    client.global.set("incident_id", response.body.incidentId);
+    client.log("Сохранен ID инцидента в переменную: " + response.body.incidentId);
+%}
+
+
+### 2. Подписка на поток обновлений статусов (Запустите СРАЗУ после POST-запроса!)
+GET http://localhost:8080/api/v1/incidents/{{incident_id}}/stream
+Accept: text/event-stream
+
+
+### 3. Отправка ручных корректировок оператора
+PUT http://localhost:8080/api/v1/incidents/{{incident_id}}/correct
+Content-Type: application/json
+
+{
+  "locomotive_series": "2ЭС6",
+  "failure_reason": "Износ щеток ТЭД (подтверждено оператором)",
+  "repair_cost": 145000.00
+}

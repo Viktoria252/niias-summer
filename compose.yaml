@@ -1,0 +1,100 @@
+version: '3.8'
+
+services:
+  # 1. СУБД PostgreSQL
+  postgres:
+    image: postgres:16-alpine
+    container_name: locomotive_postgres
+    environment:
+      POSTGRES_DB: locomotive_db
+      POSTGRES_USER: dev_user
+      POSTGRES_PASSWORD: dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data_v2:/var/lib/postgresql/data
+    networks:
+      - locomotive_network
+    restart: unless-stopped
+
+  # 2. Бэкенд-оркестратор (Spring Boot)
+  backend:
+    build:
+      context: ./backend # Путь к подпапке с бэкендом
+      dockerfile: Dockerfile
+    container_name: locomotive_backend
+    ports:
+      - "8080:8080"
+    environment:
+      # Переопределяем адрес СУБД для работы внутри Docker-сети
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/locomotive_db
+      # Выключаем встроенную поддержку Compose, так как мы уже запущены внутри Docker
+      SPRING_DOCKER_COMPOSE_ENABLED: "false"
+      # Пока тестируем на заглушках, держим true. Для работы с реальной моделью переключим в false.
+      APP_ML_MOCK_ENABLED: "false"
+      # Адрес FastAPI-сервиса во внутренней сети Docker
+      APP_ML_SERVICE_URL: "http://fastapi:8001" 
+    depends_on:
+      - postgres
+    networks:
+      - locomotive_network
+    restart: unless-stopped
+
+  # 3. vLLM-сервер (ИИ-движок, переведенный на стабильную версию v0.6.0)
+  vllm:
+    image: vllm/vllm-openai:v0.6.0 # Переключились на версию v0.6.0
+    container_name: vllm-server
+    command: >
+      --model baidu/Qianfan-OCR
+      --device cpu
+      --host 0.0.0.0
+      --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      - VLLM_TARGET_DEVICE=cpu
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    networks:
+      - locomotive_network
+    restart: unless-stopped
+
+  # 4. FastAPI-сервер (Аналитический модуль)
+  fastapi:
+    build:
+      context: ./ml_service
+      dockerfile: Dockerfile.fastapi
+    container_name: fastapi-server
+    ports:
+      - "8001:8001"
+    environment:
+      - VLLM_URL=http://vllm:8000
+      - MODEL_NAME=baidu/Qianfan-OCR
+      - VLLM_TIMEOUT=120
+      - ENABLE_THINKING=true
+    depends_on:
+      - vllm
+    networks:
+      - locomotive_network
+    restart: unless-stopped
+
+  # 5. Фронтенд (React + Nginx)
+  frontend:
+    build:
+      context: ./frontend/rzd-incidents 
+      dockerfile: Dockerfile
+    container_name: locomotive_frontend
+    ports:
+      - "80:80" # Открываем стандартный HTTP-порт во внешний мир
+    depends_on:
+      - backend
+    networks:
+      - locomotive_network
+    restart: unless-stopped
+
+volumes:
+  postgres_data_v2:
+
+networks:
+  locomotive_network:
+    driver: bridge

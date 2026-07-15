@@ -38,3 +38,22 @@ env/
 *.log
 .env
 .env.local
+
+# Среда разработки IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Папки сборки Maven (временные файлы компиляции)
+**/target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+
+# Системные файлы операционных систем
+.DS_Store
+Thumbs.db

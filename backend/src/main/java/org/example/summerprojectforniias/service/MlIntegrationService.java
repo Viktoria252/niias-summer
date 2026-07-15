@@ -3,9 +3,10 @@ package org.example.summerprojectforniias.service;
 import lombok.RequiredArgsConstructor;
 import org.example.summerprojectforniias.dto.MlResultDto;
 import org.springframework.core.io.ByteArrayResource;
+import org.springframework.http.HttpEntity;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.MultipartBodyBuilder;
 import org.springframework.stereotype.Service;
-import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.client.RestClient;
 
@@ -16,21 +17,18 @@ public class MlIntegrationService {
     private final RestClient mlRestClient;
 
     public MlResultDto extractData(byte[] fileData, String fileName) {
-        // Оборачиваем массив байт в ByteArrayResource, переопределяя getFilename
-        ByteArrayResource fileResource = new ByteArrayResource(fileData) {
-            @Override
-            public String getFilename() {
-                return fileName;
-            }
-        };
+        ByteArrayResource fileResource = new ByteArrayResource(fileData);
 
-        MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
-        body.add("file", fileResource);
+        MultipartBodyBuilder builder = new MultipartBodyBuilder();
 
-        // POST запрос к FastAPI (/api/v1/extract) формата multipart/form-data
+        builder.part("file", fileResource)
+                .filename(fileName)
+                .contentType(MediaType.APPLICATION_OCTET_STREAM);
+
+        MultiValueMap<String, HttpEntity<?>> body = builder.build();
+
         return mlRestClient.post()
                 .uri("/ocr")
-                .contentType(MediaType.MULTIPART_FORM_DATA)
                 .body(body)
                 .retrieve()
                 .body(MlResultDto.class);

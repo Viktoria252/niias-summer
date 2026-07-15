@@ -13,6 +13,7 @@ import org.example.summerprojectforniias.model.Incident;
 import org.example.summerprojectforniias.model.Document;
 
 import java.io.IOException;
+import java.util.List;
 import java.util.UUID;
 
 @RestController
@@ -69,5 +70,21 @@ public class IncidentController {
         return ResponseEntity.ok()
                 .header("Content-Disposition", "attachment; filename=\"" + doc.getFileName() + "\"")
                 .body(doc.getFileData());
+    }
+    // 6. Получение списка всех инцидентов для реестра
+    @GetMapping
+    public ResponseEntity<List<Incident>> getAllIncidents() {
+        List<Incident> incidents = incidentService.getAllIncidents(); // Предполагаем, что этот метод есть в сервисе
+        return ResponseEntity.ok(incidents);
+    }
+
+    // 7. Дозагрузка дополнительных файлов в уже существующий инцидент
+    @PostMapping(value = "/{id}/documents", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<Void> uploadAdditionalDocuments(
+            @PathVariable UUID id,
+            @RequestParam("files") MultipartFile[] files) throws IOException {
+
+        incidentService.addDocumentsToIncident(id, files); // Метод в сервисе для привязки к существующему ID
+        return ResponseEntity.ok().build();
     }
 }

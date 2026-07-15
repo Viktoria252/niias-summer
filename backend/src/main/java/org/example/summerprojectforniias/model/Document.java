@@ -1,5 +1,6 @@
 package org.example.summerprojectforniias.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import lombok.*;
 import org.hibernate.annotations.JdbcTypeCode;
@@ -23,12 +24,14 @@ public class Document {
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "incident_id", nullable = false)
+    @JsonIgnore
     private Incident incident;
 
     @Column(name = "file_name", nullable = false)
     private String fileName;
 
     @Column(name = "file_data", nullable = false)
+    @JsonIgnore
     private byte[] fileData;
 
     @Enumerated(EnumType.STRING)

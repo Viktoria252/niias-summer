@@ -40,42 +40,45 @@ services:
       - locomotive_network
     restart: unless-stopped
 
-  # 3. vLLM-сервер (ИИ-движок, переведенный на стабильную версию v0.6.0)
-  vllm:
-    image: vllm/vllm-openai:v0.6.0 # Переключились на версию v0.6.0
-    container_name: vllm-server
-    command: >
-      --model baidu/Qianfan-OCR
-      --device cpu
-      --host 0.0.0.0
-      --port 8000
-    ports:
-      - "8000:8000"
-    environment:
-      - VLLM_TARGET_DEVICE=cpu
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-    networks:
-      - locomotive_network
-    restart: unless-stopped
+  # # 3. vLLM-сервер (ИИ-движок, переведенный на стабильную версию v0.6.0)
+  # vllm:
+  #   image: vllm/vllm-openai:v0.6.0 # Переключились на версию v0.6.0
+  #   container_name: vllm-server
+  #   command: >
+  #     --model baidu/Qianfan-OCR
+  #     --device cpu
+  #     --host 0.0.0.0
+  #     --port 8000
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     - VLLM_TARGET_DEVICE=cpu
+  #   volumes:
+  #     - ~/.cache/huggingface:/root/.cache/huggingface
+  #   networks:
+  #     - locomotive_network
+  #   restart: unless-stopped
 
   # 4. FastAPI-сервер (Аналитический модуль)
   fastapi:
     build:
-      context: ./ml_service
+      context: .
       dockerfile: Dockerfile.fastapi
     container_name: fastapi-server
     ports:
       - "8001:8001"
     environment:
-      - VLLM_URL=http://vllm:8000
       - MODEL_NAME=baidu/Qianfan-OCR
-      - VLLM_TIMEOUT=120
-      - ENABLE_THINKING=true
-    depends_on:
-      - vllm
-    networks:
-      - locomotive_network
+      - CUDA_VISIBLE_DEVICES=0   # если нужна GPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]   # опционально
+    volumes:
+      - ~/.cache/huggingface:/root/.cache/huggingface
     restart: unless-stopped
 
   # 5. Фронтенд (React + Nginx)

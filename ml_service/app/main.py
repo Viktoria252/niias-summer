@@ -1,15 +1,13 @@
 import logging
-import hashlib
 import json
 import tempfile
+import traceback
 import subprocess
 import sys
 import os
-import shutil
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request  # Request добавлен сюда!
-from pydantic import BaseModel
 from src.config import MODEL_NAME
 from src.models import OCRResponse
 import uvicorn
@@ -32,7 +30,7 @@ if not MOCK_MODE:
     from transformers import AutoModel, AutoTokenizer, AutoImageProcessor, AutoConfig
     import torch.nn.functional as F
 
-    # ==================== ХАК-ПАТЧ ДЛЯ DTENSOR ====================
+    # ХАК-ПАТЧ ДЛЯ DTENSOR
     try:
         import torch.distributed.tensor
     except ImportError:
@@ -55,19 +53,17 @@ if not MOCK_MODE:
             dt_tensor.DummyDTensor = DummyDTensor
             sys.modules['torch.distributed.tensor'] = dt_tensor
             logger.warning("DTensor отсутствует в CPU-сборке PyTorch. Создана заглушка.")
-    # ==============================================================
 
-    # ==================== РЕГИСТРАЦИЯ АРХИТЕКТУРЫ МОДЕЛИ ====================
+    # РЕГИСТРАЦИЯ АРХИТЕКТУРЫ МОДЕЛИ
     try:
         from configuration_qianfan_ocr import QianfanOCRConfig
         from modeling_qianfan_ocr import QianfanOCRForConditionalGeneration
-        
+
         AutoConfig.register("qianfan_ocr", QianfanOCRConfig)
         AutoModel.register(QianfanOCRConfig, QianfanOCRForConditionalGeneration)
         logger.info("Архитектура qianfan_ocr успешно зарегистрирована в AutoModel!")
     except Exception as e:
         logger.error(f"Не удалось зарегистрировать архитектуру qianfan_ocr: {e}")
-    # ========================================================================
 
 
 app = FastAPI(title="MiResult OCR Service (Robust Mock Enabled)", version="3.0")
@@ -95,7 +91,7 @@ if not MOCK_MODE:
         logger.error(f"Не удалось загрузить реальную модель: {e}")
         raise
 else:
-    logger.info("=== ЗАПУЩЕН ДИАГНОСТИЧЕСКИЙ MOCK-РЕЖИМ ===")
+    logger.info("ЗАПУЩЕН ДИАГНОСТИЧЕСКИЙ MOCK-РЕЖИМ")
 
 
 def calculate_visual_phash(pil_image: Image.Image) -> str:
@@ -130,15 +126,15 @@ def detect_file_type(content_type: str, filename: str) -> str:
 def convert_docx_to_pdf_bytes(docx_bytes: bytes) -> bytes:
     with tempfile.TemporaryDirectory() as tmpdir:
         docx_path = Path(tmpdir) / "input.docx"
-        pdf_path = Path(tmpdir) / "input.pdf" 
+        pdf_path = Path(tmpdir) / "input.pdf"
         docx_path.write_bytes(docx_bytes)
-        
+
         cmd = [
-            "libreoffice", 
-            "--headless", 
+            "libreoffice",
+            "--headless",
             "-env:UserInstallation=file:///tmp/LibreOffice_Conversion_Profile",
-            "--convert-to", "pdf", 
-            "--outdir", str(pdf_path.parent), 
+            "--convert-to", "pdf",
+            "--outdir", str(pdf_path.parent),
             str(docx_path)
         ]
         subprocess.run(cmd, check=True, capture_output=True)
@@ -148,15 +144,15 @@ def convert_docx_to_pdf_bytes(docx_bytes: bytes) -> bytes:
 def doc_to_pdf_bytes(doc_bytes: bytes) -> bytes:
     with tempfile.TemporaryDirectory() as tmpdir:
         doc_path = Path(tmpdir) / "input.doc"
-        pdf_path = Path(tmpdir) / "input.pdf" 
+        pdf_path = Path(tmpdir) / "input.pdf"
         doc_path.write_bytes(doc_bytes)
-        
+
         cmd = [
-            "libreoffice", 
-            "--headless", 
+            "libreoffice",
+            "--headless",
             "-env:UserInstallation=file:///tmp/LibreOffice_Conversion_Profile",
-            "--convert-to", "pdf", 
-            "--outdir", str(pdf_path.parent), 
+            "--convert-to", "pdf",
+            "--outdir", str(pdf_path.parent),
             str(doc_path)
         ]
         subprocess.run(cmd, check=True, capture_output=True)
@@ -195,19 +191,20 @@ def generate_response(images: List[bytes], prompt: str, max_new_tokens: int = 51
             max_new_tokens=max_new_tokens,
             do_sample=False,
             temperature=0.0,
-            pad_token_id=tokenizer.eos_token_id,
+            pad_token_id = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.pad_token_id,
         )
 
     generated_ids = outputs[0][len(text_input["input_ids"][0]):]
     return tokenizer.decode(generated_ids, skip_special_tokens=True)
 
 
-# ---------- Общая логика обработки ----------
+# Общая логика обработки
 
 def run_file_processing(file: Optional[UploadFile], max_tokens: int) -> dict:
     filename = file.filename if file else "Пример протокола.docx"
     real_p_hash = "8f3c3c3c1c1c1c1c" # Дефолтный хэш на случай сбоев
     diagnostic_error = None
+    page_images = None
 
     # Если файл передан, пробуем выполнить реальную конвертацию и хэширование
     if file is not None:
@@ -216,7 +213,7 @@ def run_file_processing(file: Optional[UploadFile], max_tokens: int) -> dict:
             file_bytes = file.file.read()
             if not file_bytes:
                 raise ValueError("Полученный файл пуст (0 байт)")
-                
+
             file_type = detect_file_type(file.content_type or "", file.filename or "")
             logger.info(f"Определен тип файла: {file_type}")
 
@@ -239,9 +236,8 @@ def run_file_processing(file: Optional[UploadFile], max_tokens: int) -> dict:
                     raise ValueError("Не удалось нарезать PDF-файл на изображения страниц")
             else:
                 raise ValueError("Не удалось сконвертировать документ в PDF")
-                
+
         except Exception as e:
-            import traceback
             diagnostic_error = traceback.format_exc()
             logger.error(f"Ошибка при расчете реального хэша для {filename}: {diagnostic_error}")
     else:
@@ -251,16 +247,16 @@ def run_file_processing(file: Optional[UploadFile], max_tokens: int) -> dict:
     # Формирование ответа
     if MOCK_MODE:
         text_output = f"# Результаты анализа документа: {filename} (MOCK MODE)\n\n"
-        
+
         if diagnostic_error:
             text_output += (
-                f"❌ **ОШИБКА РАСЧЕТА РЕАЛЬНОГО ХЭША:**\n"
+                f"ОШИБКА РАСЧЕТА РЕАЛЬНОГО ХЭША:\n"
                 f"```text\n{diagnostic_error}\n```\n\n"
-                f"⚠️ *Используется дефолтный хэш-заглушка: `{real_p_hash}`*\n\n"
+                f"Используется дефолтный хэш-заглушка: `{real_p_hash}`\n\n"
             )
         else:
-            text_output += f"✅ **Реальный визуальный хэш успешно рассчитан:** `{real_p_hash}`\n\n"
-            
+            text_output += f"Реальный визуальный хэш успешно рассчитан: `{real_p_hash}`\n\n"
+
         text_output += (
             "--- \n"
             "Комиссия в составе представителей железной дороги и сервисного депо провела расследование.\n\n"
@@ -282,7 +278,7 @@ def run_file_processing(file: Optional[UploadFile], max_tokens: int) -> dict:
                 "failureType": "производственный",
                 "locomotiveEquipment": "локомотив ТЭМ18Д №1111",
                 "responsibleOrganization": "«ЛокоТех Сервис»",
-                
+
                 # Для фронтенда
                 "Место отказа": "перегон Хижина-Магазин (MOCK)",
                 "Дата": "2026-07-15",
@@ -299,18 +295,66 @@ def run_file_processing(file: Optional[UploadFile], max_tokens: int) -> dict:
         }
     else:
         # РЕАЛЬНЫЙ РЕЖИМ
-        if not file:
+        if not page_images or len(page_images) == 0:
             raise HTTPException(400, "Файл обязателен для реального режима ИИ")
-        pass
+        prompt = """Распознай текст на изображении и извлеки текст и следующие поля в формате JSON:
+- Извлеченный текст
+- Место отказа (дорога, станция, перегон, км, пикеты)
+- Дата (год-месяц-день)
+- Время начала отказа (часы-минуты)
+- Серия локомотива
+- Номер секции локомотива
+- Договор (номер и наименование)
+- Причина отказа
+- Вид отказа (производственный, деградационный и т.п.)
+- Оборудование локомотива
+- Наименование виновной организации (строго название компании в кавычках)
+Если какое-то поле отсутствует, оставь его пустым или со значением null.
+Ответ дай строго в виде JSON без пояснений."""
+
+        try:
+            # Вызываем модель
+            raw_output = generate_response(page_images, prompt, max_tokens)
+            # Извлекаем JSON из ответа (ищем { ... })
+            start = raw_output.find('{')
+            end = raw_output.rfind('}') + 1
+            if start != -1 and end > start:
+                json_str = raw_output[start:end]
+                full_parsed = json.loads(json_str)  # весь JSON
+
+                # Извлекаем поле "Извлеченный текст"
+                extracted_text = full_parsed.pop("Извлеченный текст", "")
+
+                # Остальные поля становятся parsed_json
+                parsed_json = full_parsed  # без "Извлеченный текст"
+
+            else:
+                # JSON не найден – сохраняем сырой вывод как текст, а в parsed_json – ошибку
+                extracted_text = raw_output
+                parsed_json = {"error": "Модель не вернула JSON", "raw_output": raw_output}
+                logger.warning("Не удалось найти JSON в ответе модели")
+        except json.JSONDecodeError as e:
+            logger.error(f"Модель вернула невалидный JSON: {raw_output}")
+            extracted_text = raw_output
+            parsed_json = {"error": "Не удалось распарсить JSON", "raw_output": raw_output}
+        except Exception as e:
+            logger.error(f"Ошибка при генерации: {e}")
+            raise HTTPException(500, f"Ошибка модели: {str(e)}")
+
+        return {
+            "extracted_text": extracted_text,
+            "parsed_json": parsed_json,
+            "p_hash": real_p_hash
+        }
 
 
-# ---------- Эндпоинты (С параметром file: Optional) ----------
+# Эндпоинты (С параметром file: Optional)
 
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr_endpoint(request: Request, file: Optional[UploadFile] = File(None), max_tokens: int = Form(default=512)):
     # Распечатываем всё, что прислал Spring Boot во внутреннюю сеть Docker
     headers = dict(request.headers)
-    logger.info("=== ДИАГНОСТИКА ЗАПРОСА /ocr ===")
+    logger.info("ДИАГНОСТИКА ЗАПРОСА /ocr")
     logger.info(f"Заголовки запроса:\n{json.dumps(headers, indent=2)}")
     try:
         form = await request.form()
@@ -323,14 +367,14 @@ async def ocr_endpoint(request: Request, file: Optional[UploadFile] = File(None)
     except Exception as e:
         logger.error(f"Не удалось прочитать входящую форму: {e}")
     logger.info("=================================")
-    
+
     return run_file_processing(file, max_tokens)
 
 
 @app.post("/process", response_model=OCRResponse)
 async def process_endpoint(request: Request, file: Optional[UploadFile] = File(None), max_tokens: int = Form(default=512)):
     headers = dict(request.headers)
-    logger.info("=== ДИАГНОСТИКА ЗАПРОСА /process ===")
+    logger.info("ДИАГНОСТИКА ЗАПРОСА /process")
     logger.info(f"Заголовки запроса:\n{json.dumps(headers, indent=2)}")
     try:
         form = await request.form()
@@ -338,7 +382,7 @@ async def process_endpoint(request: Request, file: Optional[UploadFile] = File(N
     except Exception as e:
         pass
     logger.info("====================================")
-    
+
     return run_file_processing(file, max_tokens)
 
 

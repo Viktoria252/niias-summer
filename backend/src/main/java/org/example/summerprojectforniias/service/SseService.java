@@ -17,7 +17,7 @@ public class SseService {
     private final Map<UUID, SseEmitter> emitters = new ConcurrentHashMap<>();
 
     public SseEmitter createEmitter(UUID incidentId) {
-        // Устанавливаем таймаут соединения (например, 10 минут)
+        // Устанавливаем таймаут соединения (10 минут)
         SseEmitter emitter = new SseEmitter(600_000L);
 
         emitters.put(incidentId, emitter);

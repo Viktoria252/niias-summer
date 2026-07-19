@@ -30,7 +30,6 @@ public class IncidentService {
 
     @Transactional
     public IncidentUploadResponse uploadIncidents(UUID incidentId, MultipartFile[] files) throws IOException {
-        // Строку UUID incidentId = UUID.randomUUID(); мы УДАЛИЛИ, так как ID теперь приходит из контроллера
 
         // 1. Создаем и сохраняем карточку инцидента со статусом PENDING
         Incident incident = Incident.builder()

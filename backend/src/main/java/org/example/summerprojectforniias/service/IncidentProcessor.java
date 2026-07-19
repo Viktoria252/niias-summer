@@ -42,7 +42,7 @@ public class IncidentProcessor {
                     incidentId, IncidentStatus.PROCESSING, null, false, null
             ));
 
-            // 2. Быстро достаем список документов инцидента напрямую из БД (без Lazy-проблем)
+            // 2. Быстро достаем список документов инцидента напрямую из БД 
             Incident incident = incidentRepository.findById(incidentId)
                     .orElseThrow(() -> new IllegalArgumentException("Инцидент не найден: " + incidentId));
             List<Document> documents = documentRepository.findAllByIncidentId(incidentId);
@@ -97,7 +97,6 @@ public class IncidentProcessor {
                     mlResult = mlIntegrationService.extractData(doc.getFileData(), doc.getFileName());
                 }
 
-                // Надежный побитовый расчет Хэмминга на стороне Java (100% точность)
                 // 3. Надежный побитовый расчет Хэмминга на стороне Java с выявлением оригинала
                 boolean isDuplicate = false;
                 String newHash = mlResult.p_hash();
@@ -140,7 +139,7 @@ public class IncidentProcessor {
                 // Записываем результаты обработки конкретного документа в БД
                 String parsedJsonStr = objectMapper.writeValueAsString(mlResult.parsed_json());
                 
-                // Если найден дубликат, записываем его детали в extracted_text вместо OCR
+                // Если найден дубликат, записываем его детали в extracted_text вместо OCR (прикольное решение)
                 String finalExtractedText = isDuplicate ? dupDetails : mlResult.extracted_text();
                 
                 updateDocumentResults(doc.getId(), DocumentStatus.PARSED,

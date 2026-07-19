@@ -16,7 +16,7 @@ RUN git clone -b develop --single-branch https://github.com/baidubce/skills.git 
 
 # Шаг 2. Устанавливаем зависимости
 COPY requirements.txt .
-RUN pip install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu && \
+RUN pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu && \
     pip install --no-cache-dir -r requirements.txt
 
 # Шаг 3. Копируем исходный код нашего приложения (файлы приложения перезапишут только себя)

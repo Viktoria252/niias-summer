@@ -4,7 +4,7 @@ import lombok.RequiredArgsConstructor;
 import org.example.summerprojectforniias.dto.IncidentUploadResponse;
 import org.example.summerprojectforniias.model.Document;
 import org.example.summerprojectforniias.model.Incident;
-import org.example.summerprojectforniias.service.IncidentProcessor; // Добавлен импорт
+import org.example.summerprojectforniias.service.IncidentProcessor;
 import org.example.summerprojectforniias.service.IncidentService;
 import org.example.summerprojectforniias.service.SseService;
 import org.springframework.http.MediaType;
@@ -25,7 +25,7 @@ public class IncidentController {
 
     private final IncidentService incidentService;
     private final SseService sseService;
-    private final IncidentProcessor incidentProcessor; // Внедряем асинхронный процессор
+    private final IncidentProcessor incidentProcessor;
 
     @PostMapping(consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<IncidentUploadResponse> uploadIncidents(

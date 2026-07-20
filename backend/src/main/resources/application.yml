@@ -19,10 +19,11 @@ spring:
     hibernate:
       # Спринг проверяет схему на соответствие. Таблицы создает Flyway
       ddl-auto: validate
-    show-sql: true
+    show-sql: false
     properties:
       hibernate:
-        format_sql: true
+        format_sql: false      
+        show_sql: false
 
   # 4. Автоматическое управление БД во время локальной разработки в IDE
   docker:

@@ -397,4 +397,6 @@ async def health_check():
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    # Считываем порт из переменной окружения FASTAPI_PORT (по умолчанию 8001)
+    port_env = int(os.getenv("FASTAPI_PORT", "8041"))
+    uvicorn.run(app, host="0.0.0.0", port=port_env)

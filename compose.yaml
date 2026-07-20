@@ -36,7 +36,7 @@ services:
       # Пока тестируем на заглушках, держим true. Для работы с реальной моделью переключим в false.
       APP_ML_MOCK_ENABLED: "false"
       # Адрес FastAPI-сервиса во внутренней сети Docker
-      APP_ML_SERVICE_URL: "http://fastapi:8001" 
+      APP_ML_SERVICE_URL: "http://fastapi:8041" 
     # depends_on:
     #   - postgres
     networks:
@@ -69,10 +69,11 @@ services:
       dockerfile: Dockerfile.fastapi
     container_name: fastapi-server
     ports:
-      - "8001:8001"
+      - "8041:8041"  
     environment:
       - MODEL_NAME=baidu/Qianfan-OCR
       - MOCK_MODE=true 
+      - FASTAPI_PORT=8041
       - CUDA_VISIBLE_DEVICES=0   # если нужна GPU
       - PYTHONUNBUFFERED=1 #для логов модельки
     networks:

@@ -24,7 +24,7 @@ services:
       dockerfile: Dockerfile
     container_name: locomotive_backend
     ports:
-      - "8080:8080"
+      - "8120:8120"
     environment:
       # Переопределяем адрес СУБД для работы внутри Docker-сети
       # SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/locomotive_db

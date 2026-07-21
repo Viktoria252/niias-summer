@@ -24,21 +24,15 @@ services:
       dockerfile: Dockerfile
     container_name: locomotive_backend
     ports:
-      - "8120:8120"
+      - "8120:8080"
     environment:
-      # Переопределяем адрес СУБД для работы внутри Docker-сети
-      # SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/locomotive_db
       SPRING_DATASOURCE_URL: jdbc:postgresql://host.docker.internal:5432/locomotive_db
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: postgres
-      # Выключаем встроенную поддержку Compose, так как мы уже запущены внутри Docker
       SPRING_DOCKER_COMPOSE_ENABLED: "false"
-      # Пока тестируем на заглушках, держим true. Для работы с реальной моделью переключим в false.
       APP_ML_MOCK_ENABLED: "false"
-      # Адрес FastAPI-сервиса во внутренней сети Docker
-      APP_ML_SERVICE_URL: "http://fastapi:8041" 
-    # depends_on:
-    #   - postgres
+      # Адрес FastAPI-сервиса с новым портом 8045
+      APP_ML_SERVICE_URL: "http://fastapi:8045" 
     networks:
       - locomotive_network
     restart: unless-stopped
@@ -65,28 +59,22 @@ services:
   # 4. FastAPI-сервер (Аналитический модуль)
   fastapi:
     build:
-      context: ./ml_service
+      context: ./ml_service # Контекст сборки — папка ml_service, так как Dockerfile.fastapi и requirements.txt лежат там
       dockerfile: Dockerfile.fastapi
     container_name: fastapi-server
     ports:
-      - "8041:8041"  
+      - "8045:8045"  # Проброс порта наружу
     environment:
       - MODEL_NAME=baidu/Qianfan-OCR
-      - MOCK_MODE=true 
-      - FASTAPI_PORT=8041
-      - CUDA_VISIBLE_DEVICES=0   # если нужна GPU
-      - PYTHONUNBUFFERED=1 #для логов модельки
-    networks:
-      - locomotive_network
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]   # опционально
+      - MOCK_MODE=true  # Включает режим мокового общения с нейронкой
+      - FASTAPI_PORT=8045
+      - PYTHONUNBUFFERED=1
+    # Команда запуска uvicorn указывает на модуль app.main внутри скопированной директории
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8045
     volumes:
       - ~/.cache/huggingface:/root/.cache/huggingface
+    networks:
+      - locomotive_network
     restart: unless-stopped
 
   # 5. Фронтенд (React + Nginx)
@@ -96,7 +84,7 @@ services:
       dockerfile: Dockerfile
     container_name: locomotive_frontend
     ports:
-      - "80:80" # Открываем стандартный HTTP-порт во внешний мир
+      - "80:80"
     depends_on:
       - backend
     networks:

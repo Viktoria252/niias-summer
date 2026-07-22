@@ -27,6 +27,8 @@ import uvicorn
 from pdf2image import convert_from_bytes
 from PIL import Image
 import io
+import fitz
+import pymupdf4llm
 
 # Импорты PyTorch и Transformers (нужны только в реальном режиме)
 if not MOCK_MODE:
@@ -52,10 +54,33 @@ if not MOCK_MODE:
 app = FastAPI(title="MiResult OCR Service (Real/Mock Enabled)", version="3.0")
 
 MODEL_PATH = MODEL_NAME  # "baidu/Qianfan-OCR" или локальный путь
-DEVICE = "cpu"
+DEVICE = os.getenv("DEVICE", "auto").lower()
 
 # Инициализация ИИ-модели СТРОГО в реальном режиме!
 if not MOCK_MODE:
+    if DEVICE == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("Запрошено устройство 'cuda', но CUDA недоступна.")
+        DTYPE = torch.float16
+        DEVICE_MAP = "auto"  # для распределения по нескольким GPU (если есть)
+        LOW_MEM = True
+    elif DEVICE == "cpu":
+        DTYPE = torch.float32
+        DEVICE_MAP = None
+        LOW_MEM = True  # можно оставить True, но на CPU не критично
+    else:  # "auto"
+        if torch.cuda.is_available():
+            DEVICE = "cuda"
+            DTYPE = torch.float16
+            DEVICE_MAP = "auto"
+            LOW_MEM = True
+        else:
+            DEVICE = "cpu"
+            DTYPE = torch.float32
+            DEVICE_MAP = None
+            LOW_MEM = True
+    logger.info(f"Выбрано устройство: {DEVICE}, dtype: {DTYPE}")
+
     try:
         model = QianfanOCRForConditionalGeneration.from_pretrained(
             MODEL_PATH,
@@ -63,7 +88,8 @@ if not MOCK_MODE:
             device_map=None,
             low_cpu_mem_usage=False
         )
-        model = model.to(DEVICE)
+        if DEVICE == "cpu":
+            model = model.to(DEVICE)  # явно на CPU
         tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
         image_processor = AutoImageProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
         logger.info("Реальная ИИ-модель успешно загружена на CPU!")
@@ -155,8 +181,14 @@ def generate_response(images: List[bytes], prompt: str, max_new_tokens: int = 51
     
     # Приводим пиксели к нативному для процессора float32
     pixel_values = image_processor(pil_images, return_tensors="pt").pixel_values
+
+    if DEVICE == "cuda":
+        pixel_values = pixel_values.to(dtype=torch.float16).to(DEVICE)
+        logger.info(f"Шаг 3: Пиксели подготовлены для GPU. Форма тензора: {pixel_values.shape}")
+    else:
+        pixel_values = pixel_values.to(dtype=torch.float32).to(DEVICE)
+        logger.info(f"Шаг 3: Пиксели подготовлены для CPU. Форма тензора: {pixel_values.shape}")
     pixel_values = pixel_values.to(dtype=torch.float32)
-    logger.info(f"Шаг 3: Пиксели подготовлены для CPU. Форма тензора: {pixel_values.shape}")
 
     # Токенизируем текст промпта на CPU
     text_input = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
@@ -352,6 +384,112 @@ def run_file_processing(file: Optional[UploadFile], max_tokens: int) -> dict:
         "p_hash": real_p_hash
     }
 
+# Текстовая модель (новый подход)
+# Глобальные переменные для текстовой модели
+_text_model = None
+_text_tokenizer = None
+TEXT_DEVICE = None
+TEXT_MODEL_NAME = os.getenv("TEXT_MODEL_NAME", "Qwen/Qwen2.5-Coder-7B-Instruct")
+
+
+def get_text_model():
+    global _text_model, _text_tokenizer, TEXT_DEVICE
+    if _text_model is not None:
+        return _text_model, _text_tokenizer
+
+    # Определяем устройство
+    TEXT_DEVICE = os.getenv("DEVICE", "auto").lower()
+    if TEXT_DEVICE == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("TEXT_DEVICE=cuda but CUDA not available")
+    else:
+        TEXT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    logger.info(f"Загрузка текстовой модели {TEXT_MODEL_NAME} на устройство {TEXT_DEVICE}")
+
+    # Загружаем модель с квантизацией 4-bit для экономии памяти
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+    )
+
+    _text_model = AutoModelForCausalLM.from_pretrained(
+        TEXT_MODEL_NAME,
+        quantization_config=bnb_config,
+        device_map="auto" if TEXT_DEVICE == "cuda" else None,
+        trust_remote_code=True,
+    )
+    if TEXT_DEVICE == "cpu":
+        _text_model = _text_model.to("cpu")
+
+    _text_tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL_NAME, trust_remote_code=True)
+    # Устанавливаем pad_token, если его нет
+    if _text_tokenizer.pad_token is None:
+        _text_tokenizer.pad_token = _text_tokenizer.eos_token
+
+    logger.info("Текстовая модель успешно загружена!")
+    return _text_model, _text_tokenizer
+
+
+def extract_json_from_markdown(markdown_text: str, max_tokens: int = 512) -> dict:
+    """
+    Использует текстовую LLM для извлечения структурированных полей из Markdown-текста.
+    Возвращает словарь с извлечёнными полями.
+    """
+    prompt = f"""
+Ты — интеллектуальный ассистент. Извлеки из следующего текста структурированные данные и верни их в формате JSON.
+
+Извлеки следующие поля:
+- Место отказа (дорога, станция, перегон, км, пикеты)
+- Дата (год-месяц-день)
+- Время начала отказа (часы-минуты)
+- Серия локомотива
+- Номер секции локомотива
+- Договор (номер и наименование)
+- Причина отказа
+- Вид отказа (производственный, деградационный и т.п.)
+- Оборудование локомотива
+- Наименование виновной организации (строго название компании в кавычках)
+
+Если какое-то поле отсутствует, оставь его пустым или со значением null.
+Ответ дай строго в виде JSON без пояснений.
+
+Текст:
+{markdown_text}
+"""
+    model, tokenizer = get_text_model()
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+    if TEXT_DEVICE == "cuda":
+        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            do_sample=False,
+            temperature=0.0,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+    generated = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    # Пытаемся извлечь JSON
+    try:
+        # Ищем фигурные скобки
+        start = generated.find('{')
+        end = generated.rfind('}') + 1
+        if start != -1 and end > start:
+            json_str = generated[start:end]
+            return json.loads(json_str)
+        else:
+            logger.warning("Не удалось найти JSON в ответе модели")
+            return {"raw_output": generated}
+    except Exception as e:
+        logger.error(f"Ошибка парсинга JSON: {e}")
+        return {"error": "Ошибка парсинга JSON", "raw_output": generated}
 
 # ---------- Эндпоинты ----------
 
@@ -389,6 +527,48 @@ async def process_endpoint(request: Request, file: Optional[UploadFile] = File(N
     logger.info("====================================")
     
     return run_file_processing(file, max_tokens)
+
+@app.post("/extract_from_markdown", response_model=OCRResponse)
+async def extract_from_markdown_endpoint(
+    request: Request,
+    file: UploadFile = File(...),
+    max_tokens: int = Form(default=512)
+):
+    file_bytes = await file.read()
+    if file.filename.lower().endswith('.pdf'):
+        pdf_bytes = file_bytes
+    elif file.filename.lower().endswith('.doc'):
+        pdf_bytes = (doc_to_pdf_bytes(file_bytes))
+    elif file.filename.lower().endswith('.docx'):
+        pdf_bytes = convert_docx_to_pdf_bytes(file_bytes)
+    else:
+        raise HTTPException(400, "Только PDF-файлы поддерживаются")
+
+    if not pdf_bytes:
+        raise HTTPException(400, "Файл пуст")
+
+    try:
+        # Открываем PDF из байтов
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        md_text = pymupdf4llm.to_markdown(doc)
+        if not md_text:
+            raise HTTPException(400, "Не удалось извлечь текст из PDF")
+
+        parsed_json = extract_json_from_markdown(md_text, max_tokens)
+        extracted_text = md_text
+
+        # pHash вычисляем через pdf2image (как в других эндпоинтах)
+        images = convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=1)
+        real_p_hash = calculate_visual_phash(images[0]) if images else "0000000000000000"
+
+        return {
+            "extracted_text": extracted_text,
+            "parsed_json": parsed_json,
+            "p_hash": real_p_hash
+        }
+    except Exception as e:
+        logger.error(f"Ошибка обработки: {e}")
+        raise HTTPException(500, f"Ошибка: {str(e)}")
 
 
 @app.get("/health")

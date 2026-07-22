@@ -65,6 +65,7 @@ services:
     ports:
       - "8045:8045"  # Проброс порта наружу
     environment:
+      - DEVICE=cpu
       - MODEL_NAME=baidu/Qianfan-OCR
       - MOCK_MODE=true  # Включает режим мокового общения с нейронкой
       - FASTAPI_PORT=8045

@@ -15,7 +15,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 @Service
@@ -101,6 +103,7 @@ public class IncidentProcessor {
                 boolean isDuplicate = false;
                 String newHash = mlResult.p_hash();
                 String dupDetails = null;
+                Document matchedOldDoc = null; // Ссылка на оригинальный документ в БД
                 
                 if (newHash != null) {
                     LocalDateTime thirtyDaysAgo = LocalDateTime.now().minusDays(30);
@@ -116,7 +119,9 @@ public class IncidentProcessor {
                         int distance = calculateHammingDistance(newHash, oldHash);
                         if (distance < 8) {
                             isDuplicate = true;
-                            // Генерируем детальное описание дубликата
+                            matchedOldDoc = oldDoc; // Сохраняем ссылку на найденный оригинал
+                            
+                            // Генерируем детальное описание дубликата для логов
                             dupDetails = String.format(
                                 "Текущий файл совпадает с ранее загруженным файлом '%s' в рамках Инцидента (ID: %s), который был добавлен %s.",
                                 oldDoc.getFileName(),
@@ -139,12 +144,36 @@ public class IncidentProcessor {
                 // Записываем результаты обработки конкретного документа в БД
                 String parsedJsonStr = objectMapper.writeValueAsString(mlResult.parsed_json());
                 
-                // Если найден дубликат, записываем его детали в extracted_text вместо OCR (прикольное решение)
-                String finalExtractedText = isDuplicate ? dupDetails : mlResult.extracted_text();
+                // Формируем структурированный JSON с деталями оригинального документа для фронтенда
+                String duplicateJsonDetails = null;
+                if (isDuplicate && matchedOldDoc != null) {
+                    try {
+                        Map<String, Object> detailsMap = new HashMap<>();
+                        detailsMap.put("originalIncidentId", matchedOldDoc.getIncident().getId().toString());
+                        detailsMap.put("originalDocumentId", matchedOldDoc.getId().toString());
+                        detailsMap.put("originalFileName", matchedOldDoc.getFileName());
+                        detailsMap.put("processedAt", matchedOldDoc.getCreatedAt().toString().replace("T", " в ").substring(0, 19));
+                        
+                        if (matchedOldDoc.getParsedJson() != null) {
+                            try {
+                                detailsMap.put("previouslyGeneratedFields", objectMapper.readValue(matchedOldDoc.getParsedJson(), Map.class));
+                            } catch (Exception parseEx) {
+                                log.warn("Не удалось распарсить parsedJson оригинального документа", parseEx);
+                            }
+                        }
+                        duplicateJsonDetails = objectMapper.writeValueAsString(detailsMap);
+                    } catch (Exception e) {
+                        log.error("Не удалось сформировать JSON метаданных дубликата", e);
+                        duplicateJsonDetails = "{\"error\": \"Ошибка формирования метаданных\"}";
+                    }
+                }
+
+                // В extracted_text ВСЕГДА пишем чистый распознанный текст документа
+                String finalExtractedText = mlResult.extracted_text();
                 
                 updateDocumentResults(doc.getId(), DocumentStatus.PARSED,
                         finalExtractedText, parsedJsonStr,
-                        mlResult.p_hash(), isDuplicate);
+                        mlResult.p_hash(), isDuplicate, duplicateJsonDetails);
 
                 // Отправляем промежуточные результаты на фронтенд "на лету" для автозаполнения полей формы
                 String currentMergedDataStr = objectMapper.writeValueAsString(finalMergedData);
@@ -196,13 +225,14 @@ public class IncidentProcessor {
     }
 
     @Transactional
-    public void updateDocumentResults(UUID docId, DocumentStatus status, String text, String json, String pHash, boolean isDuplicate) {
+    public void updateDocumentResults(UUID docId, DocumentStatus status, String text, String json, String pHash, boolean isDuplicate, String duplicateDetails) {
         documentRepository.findById(docId).ifPresent(doc -> {
             doc.setStatus(status);
             doc.setExtractedText(text);
             doc.setParsedJson(json);
             doc.setPHash(pHash);
             doc.setIsSuspectedDuplicate(isDuplicate);
+            doc.setDuplicateDetails(duplicateDetails); // Корректное сохранение метаданных
             documentRepository.save(doc);
         });
     }

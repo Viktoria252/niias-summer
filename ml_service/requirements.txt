@@ -9,3 +9,5 @@ python-docx==1.1.0
 transformers>=4.48.0
 accelerate==0.32.0
 einops
+pymupdf==1.25.1
+pymupdf4llm==0.0.17

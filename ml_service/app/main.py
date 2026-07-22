@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Request
+from fastapi.middleware.cors import CORSMiddleware  # Импорт CORS-плагина
 from pydantic import BaseModel
 from src.config import MODEL_NAME
 from src.models import OCRResponse
@@ -22,6 +23,13 @@ import pymupdf4llm
 
 import logging
 
+# Настраиваем логирование с временными метками (формат аналогичен Spring Boot)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s.%(msecs)03d INFO %(process)d --- [%(threadName)s] %(name)s : %(message)s',
+    datefmt='%Y-%m-%dT%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 MOCK_MODE = os.getenv("MOCK_MODE", "true").lower() == "true"
 USE_OCR = os.getenv("USE_OCR", "true").lower() == "true"
@@ -29,9 +37,16 @@ USE_OCR = os.getenv("USE_OCR", "true").lower() == "true"
 if "/app" not in sys.path:
     sys.path.append("/app")
 
-# Настраиваем логирование
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Глобальные переменные для моделей
+model = None
+tokenizer = None
+image_processor = None
+
+TEXT_MODEL = None
+TEXT_TOKENIZER = None
+TEXT_DEVICE = None
+TEXT_MODEL_NAME = os.getenv("TEXT_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
+DEVICE = os.getenv("DEVICE", "cpu").lower()
 
 # Импорты PyTorch и Transformers (нужны только в реальном режиме)
 if not MOCK_MODE:
@@ -47,7 +62,7 @@ if not MOCK_MODE:
         logger.error(f"Не удалось импортировать классы архитектуры модели: {e}")
         raise
 
-    #КАСТОМНЫЙ НЕБУФЕРИЗИРОВАННЫЙ СТРИМЕР ДЛЯ ЖИВОГО ВЫВОДА СИМВОЛОВ
+    # КАСТОМНЫЙ НЕБУФЕРИЗИРОВАННЫЙ СТРИМЕР ДЛЯ ЖИВОГО ВЫВОДА СИМВОЛОВ
     class FlushStreamer(TextStreamer):
         def on_finalized_text(self, text: str, stream_end: bool = False):
             sys.stdout.write(text)
@@ -56,14 +71,22 @@ if not MOCK_MODE:
 
 app = FastAPI(title="MiResult OCR Service (Real/Mock Enabled)", version="3.0")
 
-MODEL_PATH = MODEL_NAME  # "baidu/Qianfan-OCR" или локальный путь
-DEVICE = os.getenv("DEVICE", "auto").lower()
+# РАЗРЕШАЕМ CORS ДЛЯ ПРЯМОГО ОБРАЩЕНИЯ С ФРОНТЕНДА:
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Разрешает запросы с любых хостов (включая localhost:80)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Инициализация ИИ-модели СТРОГО в реальном режиме!
+MODEL_PATH = MODEL_NAME  # "baidu/Qianfan-OCR" или локальный путь
+
+# Инициализация ИИ-моделей СТРОГО в реальном режиме!
 if not MOCK_MODE:
     # ---------- Загрузка OCR-модели (если USE_OCR=true) ----------
     if USE_OCR:
-        DEVICE_OVERRIDE = os.getenv("DEVICE", "auto").lower()
+        DEVICE_OVERRIDE = os.getenv("DEVICE", "cpu").lower()
         if DEVICE_OVERRIDE == "cuda":
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA requested but not available")
@@ -93,30 +116,29 @@ if not MOCK_MODE:
         logger.info("OCR-модель загружена")
     else:
         logger.info("OCR-модель отключена (USE_OCR=false)")
-        # Заглушки, чтобы не было ошибок в эндпоинтах при обращении
-        model = None
-        tokenizer = None
-        image_processor = None
 
     # ---------- Загрузка текстовой модели Qwen ----------
     logger.info("Загрузка текстовой модели Qwen...")
     try:
-
-        TEXT_MODEL_NAME = os.getenv("TEXT_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
-
         # Определяем устройство для текстовой модели
-        text_dev = os.getenv("TEXT_DEVICE", "auto").lower()
+        text_dev = os.getenv("TEXT_DEVICE", "cpu").lower()
         if text_dev == "cuda":
             if not torch.cuda.is_available():
                 raise RuntimeError("TEXT_DEVICE=cuda but CUDA not available")
             TEXT_DEVICE = "cuda"
-        elif text_dev == "cpu":
-            TEXT_DEVICE = "cpu"
+            TEXT_DTYPE = torch.float16
         else:
-            TEXT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+            TEXT_DEVICE = "cpu"
+            TEXT_DTYPE = torch.float32  # СТРОГО float32 для процессора, чтобы избежать медленной эмуляции bfloat16
+
+        # Оптимизация потоков для CPU: ограничиваем до 4 физических ядер, чтобы избежать взаимной блокировки процессора
+        if TEXT_DEVICE == "cpu":
+            torch.set_num_threads(4)
+            logger.info("Установлено ограничение PyTorch: 4 потока для CPU-вычислений.")
 
         TEXT_MODEL = AutoModelForCausalLM.from_pretrained(
             TEXT_MODEL_NAME,
+            torch_dtype=TEXT_DTYPE,
             device_map="auto" if TEXT_DEVICE == "cuda" else None,
             trust_remote_code=True,
         )
@@ -128,16 +150,15 @@ if not MOCK_MODE:
         if TEXT_TOKENIZER.pad_token is None:
             TEXT_TOKENIZER.pad_token = TEXT_TOKENIZER.eos_token
 
-        logger.info(f"Текстовая модель {TEXT_MODEL_NAME} загружена на {TEXT_DEVICE}")
+        logger.info(f"Текстовая модель {TEXT_MODEL_NAME} загружена на {TEXT_DEVICE} в формате {TEXT_DTYPE}")
     except Exception as e:
         logger.error(f"Не удалось загрузить текстовую модель: {e}")
         raise
 else:
-    logger.info("Мок-режим: модели не загружаются")
+    logger.info("=== ЗАПУЩЕН ДИАГНОСТИЧЕСКИЙ MOCK-РЕЖИМ ===")
+
+
 def calculate_visual_phash(pil_image: Image.Image) -> str:
-    """
-    Быстрый чистый расчет перцептивного хэша (pHash) изображения на базе Pillow.
-    """
     img = pil_image.convert("L").resize((8, 8), Image.Resampling.LANCZOS)
     pixels = list(img.getdata())
     avg = sum(pixels) / 64
@@ -212,8 +233,6 @@ def pdf_bytes_to_images(pdf_bytes: bytes) -> List[bytes]:
 
 def generate_response(images: List[bytes], prompt: str, max_new_tokens: int = 512) -> str:
     pil_images = [Image.open(io.BytesIO(img)) for img in images]
-    
-    # Приводим пиксели к нативному для процессора float32
     pixel_values = image_processor(pil_images, return_tensors="pt").pixel_values
 
     if DEVICE == "cuda":
@@ -222,17 +241,12 @@ def generate_response(images: List[bytes], prompt: str, max_new_tokens: int = 51
     else:
         pixel_values = pixel_values.to(dtype=torch.float32).to(DEVICE)
         logger.info(f"Шаг 3: Пиксели подготовлены для CPU. Форма тензора: {pixel_values.shape}")
-    pixel_values = pixel_values.to(dtype=torch.float32)
 
-    # Токенизируем текст промпта на CPU
     text_input = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
     input_ids = text_input["input_ids"]
     attention_mask = text_input["attention_mask"]
     
-    # Считываем точный ID токена картинки из конфига
     image_token_id = getattr(model.config, "image_token_id", 151671)
-    
-    # ДИНАМИЧЕСКИЙ РАСЧЕТ НЕОБХОДИМОГО КОЛИЧЕСТВА ТОКЕНОВ КАРТИНКИ
     num_image_tokens = pixel_values.shape[0] * 256
     logger.info(f"Шаг 5: Обнаружено {pixel_values.shape[0]} плиток изображения. Требуется ровно {num_image_tokens} токенов в input_ids.")
 
@@ -242,30 +256,20 @@ def generate_response(images: List[bytes], prompt: str, max_new_tokens: int = 51
         needed_tokens = num_image_tokens - existing_tokens_count
         logger.info(f"Шаг 6: Вставляем {needed_tokens} токенов изображения в начало тензора...")
         
-        # Создаем тензор токенов изображения на CPU
         image_token_tensor = torch.tensor([[image_token_id] * needed_tokens], dtype=torch.long)
         input_ids = torch.cat([image_token_tensor, input_ids], dim=1)
         
-        # Создаем attention_mask на CPU
         ones_tensor = torch.ones((1, needed_tokens), dtype=torch.long)
         attention_mask = torch.cat([ones_tensor, attention_mask], dim=1)
-
-    # Кастомный небуферизируемый стример
-    from transformers import TextStreamer
-    class FlushStreamer(TextStreamer):
-        def on_finalized_text(self, text: str, stream_end: bool = False):
-            sys.stdout.write(text)
-            sys.stdout.flush()
 
     streamer = FlushStreamer(tokenizer, skip_prompt=True)
 
     inputs = {
-        "pixel_values": pixel_values,
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
+        "pixel_values": pixel_values.to(DEVICE),
+        "input_ids": input_ids.to(DEVICE),
+        "attention_mask": attention_mask.to(DEVICE),
     }
 
-    # Запускаем генерацию
     with torch.no_grad():
         outputs = model.generate(
             **inputs,
@@ -288,7 +292,7 @@ def run_file_processing(file: Optional[UploadFile], max_tokens: int) -> dict:
     diagnostic_error = None
 
     try:
-        file_bytes = file.file.read()
+        file_bytes = file.file.read() if file else b""
         if not file_bytes:
             raise ValueError("Полученный файл пуст (0 байт)")
             
@@ -320,67 +324,103 @@ def run_file_processing(file: Optional[UploadFile], max_tokens: int) -> dict:
         logger.error(f"Ошибка при расчете реального хэша для {filename}: {diagnostic_error}")
         raise HTTPException(500, f"Ошибка обработки файла: {e}")
 
-    #  РЕАЛЬНЫЙ РЕЖИМ НЕЙРОСЕТИ (Qianfan-OCR) на CPU 
     if MOCK_MODE:
         text_output = f"# Результаты анализа документа: {filename} (MOCK MODE)\n\n"
-        
         if diagnostic_error:
-            text_output += (
-                f"❌ **ОШИБКА РАСЧЕТА РЕАЛЬНОГО ХЭША:**\n"
-                f"```text\n{diagnostic_error}\n```\n\n"
-                f"⚠️ *Используется дефолтный хэш-заглушка: `{real_p_hash}`*\n\n"
-            )
+            text_output += f"❌ **ОШИБКА РАСЧЕТА РЕАЛЬНОГО ХЭША:**\n```text\n{diagnostic_error}\n```\n\n"
         else:
             text_output += f"✅ **Реальный визуальный хэш успешно рассчитан:** `{real_p_hash}`\n\n"
             
-        text_output += (
-            "--- \n"
-            "Комиссия в составе представителей железной дороги и сервисного депо провела расследование.\n\n"
-            "**Установлено:** случай отказа локомотива ТЭМ18Д №1111 на перегоне Хижина-Магазин "
-            "произошел из-за неисправности турбины ТК-30. Виновная организация — «ЛокоТех Сервис»."
-        )
-
+        text_output += "Комиссия установила: случай отказа локомотива ТЭМ18Д №1111..."
         return {
             "extracted_text": text_output,
             "parsed_json": {
-                # Для Java DTO
                 "failureLocation": "перегон Хижина-Магазин (MOCK)",
                 "failureDate": "2026-07-15",
                 "failureTime": "22:56",
                 "locomotiveSeries": "ТЭМ18Д",
                 "locomotiveSectionNumber": "№1111",
                 "contract": "№999 от 01.01.2014",
-                "failureReason": "неисправность турбины ТК-30 (посторонний шум при работе)",
+                "failureReason": "неисправность турбины (MOCK)",
                 "failureType": "производственный",
                 "locomotiveEquipment": "локомотив ТЭМ18Д №1111",
-                "responsibleOrganization": "«ЛокоТех Сервис»",
-                
-                # Для фронтенда
-                "Место отказа": "перегон Хижина-Магазин (MOCK)",
-                "Дата": "2026-07-15",
-                "Время начала отказа": "22:56",
-                "Серия локомотива": "ТЭМ18Д",
-                "Номер секции локомотива": "№1111",
-                "Договор": "№999 от 01.01.2014",
-                "Причина отказа": "неисправность турбины ТК-30 (посторонний шум при работе)",
-                "Вид отказа": "производственный",
-                "Оборудование локомотива": "локомотив ТЭМ18Д №1111",
-                "Наименование виновной организации": "«ЛокоТех Сервис»"
+                "responsibleOrganization": "«ЛокоТех Сервис»"
             },
             "p_hash": real_p_hash
         }
 
-    # ==================== РЕАЛЬНЫЙ РЕЖИМ НЕЙРОСЕТИ (Qianfan-OCR) на CPU ====================
-    # 1. Извлекаем Markdown-текст
-    prompt_md = (
-        "Распознай текст на изображениях и верни его в формате Markdown. "
-        "Сохрани структуру (заголовки, списки, таблицы), если они есть."
-    )
-    logger.info("Отправляем запрос в нейросеть для получения Markdown-текста...")
+    # ==================== РЕАЛЬНЫЙ РЕЖИМ РАБОТЫ ИИ ====================
+
+    # Умный Фолбэк: если OCR отключен, перехватываем файлы и парсим их через быстрый PyMuPDF
+    if not USE_OCR:
+        logger.info("USE_OCR=false. Автоматически перенаправляем запрос на быстрый парсинг PyMuPDF + Qwen...")
+        try:
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            md_text = pymupdf4llm.to_markdown(doc)
+            if not md_text:
+                raise ValueError("Не удалось программно извлечь текст из PDF")
+
+            # Отправляем полученный Markdown-текст в модель Qwen
+            parsed_json = extract_json_from_markdown(md_text, max_tokens)
+            return {
+                "extracted_text": md_text,
+                "parsed_json": parsed_json,
+                "p_hash": real_p_hash
+            }
+        except Exception as e:
+            logger.error(f"Ошибка умного фолбэка без OCR: {e}")
+            raise HTTPException(500, f"Ошибка фолбэк-обработки: {str(e)}")
+
+    # Если OCR включен (Тяжелый визуальный ИИ)
+    prompt_md = "Распознай текст на изображениях и верни его в формате Markdown."
     extracted_text = generate_response(page_images, prompt_md, max_tokens)
 
-    # 2. Извлекаем JSON-данные
-    prompt_json = """Распознай текст на изображении и извлеки следующие поля в формате JSON:
+    prompt_json = "Распознай текст на изображении и извлеки поля в формате JSON..."
+    json_str = generate_response(page_images, prompt_json, max_tokens)
+    
+    try:
+        clean_json_str = json_str.strip()
+        if clean_json_str.startswith("```json"):
+            clean_json_str = clean_json_str[7:]
+        if clean_json_str.endswith("```"):
+            clean_json_str = clean_json_str[:-3]
+        parsed_json = json.loads(clean_json_str.strip())
+    except Exception as e:
+        logger.warning(f"Не удалось распарсить JSON: {e}")
+        parsed_json = {}
+
+    return {
+        "extracted_text": extracted_text,
+        "parsed_json": parsed_json,
+        "p_hash": real_p_hash
+    }
+
+
+def extract_json_from_markdown(markdown_text: str, max_tokens: int = 512) -> dict:
+    """
+    Использует текстовую LLM Qwen для извлечения структурированных полей из Markdown-текста.
+    """
+    if MOCK_MODE:
+        return {
+            "failureLocation": "перегон Хижина-Магазин (MOCK-TEXT)",
+            "failureDate": "2026-07-15",
+            "failureTime": "22:56",
+            "locomotiveSeries": "ТЭМ18Д",
+            "locomotiveSectionNumber": "№1111",
+            "contract": "№999 от 01.01.2014",
+            "failureReason": "неисправность турбины (MOCK-TEXT)",
+            "failureType": "производственный",
+            "locomotiveEquipment": "локомотив ТЭМ18Д №1111",
+            "responsibleOrganization": "«ЛокоТех Сервис»"
+        }
+
+    if TEXT_MODEL is None or TEXT_TOKENIZER is None:
+        raise RuntimeError("Текстовая модель не загружена")
+
+    messages = [
+        {"role": "system", "content": "Ты — ассистент, который извлекает структурированные данные из текста."},
+        {"role": "user", "content": f"""
+Извлеки из следующего текста поля в формате JSON:
 - Место отказа (дорога, станция, перегон, км, пикеты)
 - Дата (год-месяц-день)
 - Время начала отказа (часы-минуты)
@@ -390,175 +430,57 @@ def run_file_processing(file: Optional[UploadFile], max_tokens: int) -> dict:
 - Причина отказа
 - Вид отказа (производственный, деградационный и т.п.)
 - Оборудование локомотива
-- Наименование виновной организации (строго название компании в кавычках)
+- Наименование виновной организации
 
-Если какое-то поле отсутствует, оставь его пустым или со значением null.
-Ответ дай строго в виде JSON без пояснений."""
-    
-    logger.info("Отправляем запрос в нейросеть для получения JSON-полей...")
-    json_str = generate_response(page_images, prompt_json, max_tokens)
-    
-    # Парсим полученный от ИИ JSON
-    try:
-        clean_json_str = json_str.strip()
-        if clean_json_str.startswith("```json"):
-            clean_json_str = clean_json_str[7:]
-        if clean_json_str.endswith("```"):
-            clean_json_str = clean_json_str[:-3]
-        clean_json_str = clean_json_str.strip()
-        
-        parsed_json = json.loads(clean_json_str)
-    except Exception as e:
-        logger.warning(f"Не удалось распарсить JSON нейросети ({json_str[:150]}): {e}")
-        parsed_json = {}
+Если поле отсутствует, используй null. Ответ дай строго в виде JSON без пояснений.
 
-    return {
-        "extracted_text": extracted_text,
-        "parsed_json": parsed_json,
-        "p_hash": real_p_hash
-    }
+Текст:
+{markdown_text}
+"""}
+    ]
 
-# Текстовая модель (новый подход)
-# Глобальные переменные для текстовой модели
-_text_model = None
-_text_tokenizer = None
-TEXT_DEVICE = None
-TEXT_MODEL_NAME = os.getenv("TEXT_MODEL_NAME", "Qwen/Qwen2.5-Coder-7B-Instruct")
-
-
-def get_text_model():
-    global _text_model, _text_tokenizer, TEXT_DEVICE
-    if _text_model is not None:
-        return _text_model, _text_tokenizer
-
-    # Определяем устройство
-    TEXT_DEVICE = os.getenv("DEVICE", "auto").lower()
+    prompt = TEXT_TOKENIZER.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = TEXT_TOKENIZER(prompt, return_tensors="pt", truncation=True, max_length=4096)
     if TEXT_DEVICE == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("TEXT_DEVICE=cuda but CUDA not available")
-    else:
-        TEXT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+        inputs = {k: v.to("cuda") for k, v in inputs.items()}
 
-    logger.info(f"Загрузка текстовой модели {TEXT_MODEL_NAME} на устройство {TEXT_DEVICE}")
+    with torch.no_grad():
+        outputs = TEXT_MODEL.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            do_sample=False,
+            temperature=0.0,
+            pad_token_id=TEXT_TOKENIZER.pad_token_id,
+        )
 
-    _text_model = AutoModelForCausalLM.from_pretrained(
-        TEXT_MODEL_NAME,
-        device_map="auto" if TEXT_DEVICE == "cuda" else None,
-        trust_remote_code=True,
-    )
-    if TEXT_DEVICE == "cpu":
-        _text_model = _text_model.to("cpu")
+    generated = TEXT_TOKENIZER.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
 
-    _text_tokenizer = AutoTokenizer.from_pretrained(TEXT_MODEL_NAME, trust_remote_code=True)
-    # Устанавливаем pad_token, если его нет
-    if _text_tokenizer.pad_token is None:
-        _text_tokenizer.pad_token = _text_tokenizer.eos_token
+    try:
+        start = generated.find('{')
+        end = generated.rfind('}') + 1
+        if start != -1 and end > start:
+            return json.loads(generated[start:end])
+        else:
+            logger.warning("Не удалось найти JSON в ответе модели")
+            return {"raw_output": generated}
+    except Exception as e:
+        logger.error(f"Ошибка парсинга JSON: {e}")
+        return {"error": "Ошибка парсинга JSON", "raw_output": generated}
 
-    logger.info("Текстовая модель успешно загружена!")
-    return _text_model, _text_tokenizer
-
-
-def extract_json_from_markdown(markdown_text: str, max_tokens: int = 512) -> dict:
-    """
-    Использует текстовую LLM для извлечения структурированных полей из Markdown-текста.
-    Возвращает словарь с извлечёнными полями.
-    """
-
-    def extract_json_from_markdown(markdown_text: str, max_tokens: int = 512) -> dict:
-        if TEXT_MODEL is None or TEXT_TOKENIZER is None:
-            raise RuntimeError("Текстовая модель не загружена")
-
-        messages = [
-            {"role": "system", "content": "Ты — ассистент, который извлекает структурированные данные из текста."},
-            {"role": "user", "content": f"""
-    Извлеки из следующего текста поля в формате JSON:
-    - Место отказа (дорога, станция, перегон, км, пикеты)
-    - Дата (год-месяц-день)
-    - Время начала отказа (часы-минуты)
-    - Серия локомотива
-    - Номер секции локомотива
-    - Договор (номер и наименование)
-    - Причина отказа
-    - Вид отказа (производственный, деградационный и т.п.)
-    - Оборудование локомотива
-    - Наименование виновной организации
-
-    Если поле отсутствует, используй null. Ответ дай строго в виде JSON без пояснений.
-
-    Текст:
-    {markdown_text}
-    """}
-        ]
-
-        prompt = TEXT_TOKENIZER.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = TEXT_TOKENIZER(prompt, return_tensors="pt", truncation=True, max_length=4096)
-        if TEXT_DEVICE == "cuda":
-            inputs = {k: v.to("cuda") for k, v in inputs.items()}
-
-        with torch.no_grad():
-            outputs = TEXT_MODEL.generate(
-                **inputs,
-                max_new_tokens=max_tokens,
-                do_sample=False,
-                temperature=0.0,
-                pad_token_id=TEXT_TOKENIZER.pad_token_id,
-            )
-
-        generated = TEXT_TOKENIZER.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-
-        # Парсинг JSON
-        try:
-            start = generated.find('{')
-            end = generated.rfind('}') + 1
-            if start != -1 and end > start:
-                return json.loads(generated[start:end])
-            else:
-                logger.warning("Не удалось найти JSON в ответе модели")
-                return {"raw_output": generated}
-        except Exception as e:
-            logger.error(f"Ошибка парсинга JSON: {e}")
-            return {"error": "Ошибка парсинга JSON", "raw_output": generated}
 
 # ---------- Эндпоинты ----------
 
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr_endpoint(request: Request, file: Optional[UploadFile] = File(None), max_tokens: int = Form(default=512)):
-    if not USE_OCR:
-        raise HTTPException(503, "OCR-модель отключена. Установите USE_OCR=true в окружении.")
-    # Распечатываем всё, что прислал Spring Boot во внутреннюю сеть Docker
-    headers = dict(request.headers)
-    logger.info("=== ДИАГНОСТИКА ЗАПРОСА /ocr ===")
-    logger.info(f"Заголовки запроса:\n{json.dumps(headers, indent=2)}")
-    try:
-        form = await request.form()
-        logger.info(f"Все ключи в теле формы: {list(form.keys())}")
-        for k, v in form.items():
-            if isinstance(v, UploadFile):
-                logger.info(f"  - Найдено поле файла '{k}': имя файла = '{v.filename}', Content-Type = '{v.content_type}'")
-            else:
-                logger.info(f"  - Найдено текстовое поле '{k}': размер = {len(str(v))} симв.")
-    except Exception as e:
-        logger.error(f"Не удалось прочитать входящую форму: {e}")
-    logger.info("=================================")
-    
+    # Блокировка 503 убрана. Эндпоинт автоматически выберет быстрый PyMuPDF-режим, если USE_OCR=false
     return run_file_processing(file, max_tokens)
 
 
 @app.post("/process", response_model=OCRResponse)
 async def process_endpoint(request: Request, file: Optional[UploadFile] = File(None), max_tokens: int = Form(default=512)):
-    if not USE_OCR:
-        raise HTTPException(503, "OCR-модель отключена. Установите USE_OCR=true в окружении.")
-    headers = dict(request.headers)
-    logger.info("=== ДИАГНОСТИКА ЗАПРОСА /process ===")
-    logger.info(f"Заголовки запроса:\n{json.dumps(headers, indent=2)}")
-    try:
-        form = await request.form()
-        logger.info(f"Все ключи в теле формы: {list(form.keys())}")
-    except Exception as e:
-        pass
-    logger.info("====================================")
-    
+    # Блокировка 503 убрана. Эндпоинт автоматически выберет быстрый PyMuPDF-режим, если USE_OCR=false
     return run_file_processing(file, max_tokens)
+
 
 @app.post("/extract_from_markdown", response_model=OCRResponse)
 async def extract_from_markdown_endpoint(
@@ -570,11 +492,11 @@ async def extract_from_markdown_endpoint(
     if file.filename.lower().endswith('.pdf'):
         pdf_bytes = file_bytes
     elif file.filename.lower().endswith('.doc'):
-        pdf_bytes = (doc_to_pdf_bytes(file_bytes))
+        pdf_bytes = doc_to_pdf_bytes(file_bytes)
     elif file.filename.lower().endswith('.docx'):
         pdf_bytes = convert_docx_to_pdf_bytes(file_bytes)
     else:
-        raise HTTPException(400, "Только PDF-файлы поддерживаются")
+        raise HTTPException(400, "Только PDF/DOC/DOCX файлы поддерживаются")
 
     if not pdf_bytes:
         raise HTTPException(400, "Файл пуст")
@@ -589,7 +511,6 @@ async def extract_from_markdown_endpoint(
         parsed_json = extract_json_from_markdown(md_text, max_tokens)
         extracted_text = md_text
 
-        # pHash вычисляем через pdf2image (как в других эндпоинтах)
         images = convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=1)
         real_p_hash = calculate_visual_phash(images[0]) if images else "0000000000000000"
 
@@ -605,10 +526,9 @@ async def extract_from_markdown_endpoint(
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "mode": "real"}
+    return {"status": "healthy", "mode": "real" if not MOCK_MODE else "mock"}
 
 
 if __name__ == "__main__":
-    # Считываем порт из переменной окружения FASTAPI_PORT (по умолчанию 8001)
     port_env = int(os.getenv("FASTAPI_PORT", "8041"))
     uvicorn.run(app, host="0.0.0.0", port=port_env)

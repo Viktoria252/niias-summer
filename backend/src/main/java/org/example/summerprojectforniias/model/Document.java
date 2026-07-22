@@ -54,6 +54,9 @@ public class Document {
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
 
+    @Column(name = "duplicate_details", columnDefinition = "TEXT")
+    private String duplicateDetails;
+
     @PrePersist
     protected void onCreate() {
         this.createdAt = LocalDateTime.now();

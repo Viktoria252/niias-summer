@@ -1,45 +1,62 @@
 version: '3.8'
 
 services:
-  # 1. СУБД PostgreSQL
+  # =========================================================================
+  # 1. СУБД PostgreSQL (Временно закомментирована, так как СУБД запущена на хосте)
+  # =========================================================================
   # postgres:
-  #   image: postgres:16-alpine
-  #   container_name: locomotive_postgres
+  #   image: postgres:16-alpine            # Используем легковесный образ Postgres на базе Alpine Linux
+  #   container_name: locomotive_postgres  # Уникальное имя контейнера в системе
   #   environment:
-  #     POSTGRES_DB: locomotive_db
-  #     POSTGRES_USER: dev_user
-  #     POSTGRES_PASSWORD: dev_password
+  #     POSTGRES_DB: locomotive_db         # Имя создаваемой базы данных
+  #     POSTGRES_USER: dev_user            # Имя администратора БД
+  #     POSTGRES_PASSWORD: dev_password    # Пароль администратора БД
   #   ports:
-  #     - "5432:5432"
+  #     - "5432:5432"                      # Пробрасываем порт 5432 наружу на хост-машину
   #   volumes:
-  #     - postgres_data_v2:/var/lib/postgresql/data
+  #     - postgres_data_v2:/var/lib/postgresql/data # Постоянное хранилище для файлов БД на хосте
   #   networks:
-  #     - locomotive_network
-  #   restart: unless-stopped
+  #     - locomotive_network               # Подключаем к общей изолированной сети проектов
+  #   restart: unless-stopped              # Перезапускать контейнер автоматически, если он упал
 
-  # 2. Бэкенд-оркестратор (Spring Boot)
+  # =========================================================================
+  # 2. Бэкенд-оркестратор (Приложение на Spring Boot)
+  # =========================================================================
   backend:
     build:
-      context: ./backend # Путь к подпапке с бэкендом
-      dockerfile: Dockerfile
-    container_name: locomotive_backend
+      context: ./backend                 # Путь к папке с исходным кодом бэкенда (там лежит Dockerfile)
+      dockerfile: Dockerfile             # Имя файла сборки
+    container_name: locomotive_backend   # Имя контейнера в Docker
     ports:
-      - "8120:8080"
+      - "8120:8080"                      # Маппинг: порт 8120 на вашем ПК ведет на внутренний порт 8080 бэкенда
     environment:
-      SPRING_DATASOURCE_URL: jdbc:postgresql://host.docker.internal:5432/locomotive_db
+      # Подключение к БД на хост-машине (через шлюз host.docker.internal) с сессией по МСК времени (UTC+3)
+      SPRING_DATASOURCE_URL: jdbc:postgresql://host.docker.internal:5432/locomotive_db?options=-c%20timezone=Europe/Moscow
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: postgres
+      
+      # Выключаем автоматическую поддержку Compose от Spring Boot (так как мы запускаем всё руками через Docker)
       SPRING_DOCKER_COMPOSE_ENABLED: "false"
+      
+      # Переключатель мок-режима на бэкенде:
+      # "true" - бэк выдает готовые заглушки; "false" - бэк отправляет реальные файлы в FastAPI
       APP_ML_MOCK_ENABLED: "false"
-      # Адрес FastAPI-сервиса с новым портом 8045
+      
+      # Адрес аналитического Python-сервиса внутри внутренней сети Docker на порту 8045
       APP_ML_SERVICE_URL: "http://fastapi:8045" 
+      
+      # Синхронизируем системное время контейнера с Московским (UTC+3)
+      TZ: "Europe/Moscow"
     networks:
-      - locomotive_network
+      - locomotive_network               # Подключаем к общей сети контейнеров
     restart: unless-stopped
 
-  # # 3. vLLM-сервер (ИИ-движок, переведенный на стабильную версию v0.6.0)
+  # =========================================================================
+  # 3. vLLM-сервер (Устаревший ИИ-движок, закомментирован)
+  # Вычисления перенесены напрямую в FastAPI (библиотека PyTorch) для экономии ОЗУ
+  # =========================================================================
   # vllm:
-  #   image: vllm/vllm-openai:v0.6.0 # Переключились на версию v0.6.0
+  #   image: vllm/vllm-openai:v0.6.0
   #   container_name: vllm-server
   #   command: >
   #     --model baidu/Qianfan-OCR
@@ -56,46 +73,87 @@ services:
   #     - locomotive_network
   #   restart: unless-stopped
 
-  # 4. FastAPI-сервер (Аналитический модуль)
+  # =========================================================================
+  # 4. FastAPI-сервер (Аналитический Python-модуль распознавания)
+  # =========================================================================
   fastapi:
     build:
-      context: ./ml_service # Контекст сборки — папка ml_service, так как Dockerfile.fastapi и requirements.txt лежат там
-      dockerfile: Dockerfile.fastapi
+      context: ./ml_service              # Путь к папке аналитического сервиса
+      dockerfile: Dockerfile.fastapi     # Dockerfile для сборки Python-окружения
     container_name: fastapi-server
     ports:
-      - "8045:8045"  # Проброс порта наружу
+      - "8045:8045"                      # Проброс порта 8045 наружу для прямой связи панели разработчика с FastAPI
     environment:
-      - USE_OCR=true
-      - DEVICE=cpu
-      - MODEL_NAME=baidu/Qianfan-OCR
-      - MOCK_MODE=true  # Включает режим мокового общения с нейронкой
+      # Переключатель визуального OCR: 
+      # "true" - сканы распознаются визуально (Qianfan-OCR); 
+      # "false" - текст быстро вытаскивается программно через PyMuPDF (для цифровых PDF)
+      - USE_OCR=false   
+      
+      # Переключатели устройств вычислений для моделей (cpu - процессор, cuda - видеокарта NVIDIA)
+      - DEVICE=cpu                       # Устройство вычислений для OCR-модели (Qianfan)
+      - TEXT_DEVICE=cpu                  # Устройство вычислений для текстовой модели (Qwen)
+      
+      # Имя загружаемой текстовой модели Qwen (версия 3B оптимальна по скорости/памяти для CPU)
+      - TEXT_MODEL_NAME=Qwen/Qwen2.5-3B-Instruct
+      
+      # Путь к локальной папке весов OCR-модели внутри контейнера
+      - MODEL_NAME=/app/qianfan_ocr_flat
+      
+      # Мок-режим FastAPI: "false" - вычисления выполняют реальные ИИ-модели
+      - MOCK_MODE=false  
+      
+      # Внутренний порт, который слушает сервер uvicorn внутри контейнера
       - FASTAPI_PORT=8045
+      
+      # Отключает буферизацию вывода Python (логи пишутся в консоль мгновенно без задержек)
       - PYTHONUNBUFFERED=1
-    # Команда запуска uvicorn указывает на модуль app.main внутри скопированной директории
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8045
+      
+      # Синхронизируем системное время контейнера с Московским (UTC+3)
+      - TZ=Europe/Moscow
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8045  # Команда запуска FastAPI сервера
     volumes:
+      # 1. Монтируем локальную папку с весами OCR-модели (9.5 ГБ) с вашего ПК внутрь контейнера, 
+      # чтобы модель НЕ скачивалась заново из интернета при каждом запуске.
+      - ./qianfan_ocr_flat:/app/qianfan_ocr_flat
+      
+      # 2. Монтируем кэш HuggingFace вашего ПК внутрь контейнера. Скачанная модель Qwen (6 ГБ) 
+      # сохранится на вашем диске навсегда и не будет скачиваться повторно при перезапуске Docker.
       - ~/.cache/huggingface:/root/.cache/huggingface
     networks:
       - locomotive_network
     restart: unless-stopped
+    
+    # ЕСЛИ ВЫ ИСПОЛЬЗУЕТЕ GPU (DEVICE=cuda и TEXT_DEVICE=cuda), 
+    # РАСКОММЕНТИРУЙТЕ СЛЕДУЮЩИЕ СТРОКИ ДЛЯ ДОСТУПА КОНТЕЙНЕРА К ВИДЕОКАРТЕ:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
 
-  # 5. Фронтенд (React + Nginx)
+  # =========================================================================
+  # 5. Фронтенд (React-приложение, раздаваемое через Nginx)
+  # =========================================================================
   frontend:
     build:
-      context: ./frontend/rzd-incidents 
-      dockerfile: Dockerfile
+      context: ./frontend/rzd-incidents  # Путь к папке с фронтендом React
+      dockerfile: Dockerfile             # Dockerfile, собирающий React-статику и запускающий Nginx
     container_name: locomotive_frontend
     ports:
-      - "80:80"
+      - "80:80"                          # Пробрасываем стандартный HTTP-порт 80 во внешний мир
     depends_on:
-      - backend
+      - backend                          # Фронтенд запустится только после успешного старта бэкенда
     networks:
-      - locomotive_network
+      - locomotive_network               # Общая Docker-сеть
     restart: unless-stopped
 
+# Описание сохраняемых томов (используется для БД Postgres, когда она раскомментирована)
 volumes:
   postgres_data_v2:
 
+# Изолированная мостовая сеть (Bridge), внутри которой контейнеры видят друг друга по именам сервисов
 networks:
   locomotive_network:
     driver: bridge

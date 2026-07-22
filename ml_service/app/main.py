@@ -1,16 +1,5 @@
 import sys
 import os
-
-MOCK_MODE = os.getenv("MOCK_MODE", "true").lower() == "true"
-
-if "/app" not in sys.path:
-    sys.path.append("/app")
-
-import logging
-# Настраиваем логирование
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 import hashlib
 import json
 import tempfile
@@ -22,6 +11,7 @@ from pydantic import BaseModel
 from src.config import MODEL_NAME
 from src.models import OCRResponse
 import uvicorn
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # Работа с документами и изображениями
 from pdf2image import convert_from_bytes
@@ -29,6 +19,19 @@ from PIL import Image
 import io
 import fitz
 import pymupdf4llm
+
+import logging
+
+
+MOCK_MODE = os.getenv("MOCK_MODE", "true").lower() == "true"
+USE_OCR = os.getenv("USE_OCR", "true").lower() == "true"
+
+if "/app" not in sys.path:
+    sys.path.append("/app")
+
+# Настраиваем логирование
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Импорты PyTorch и Transformers (нужны только в реальном режиме)
 if not MOCK_MODE:
@@ -58,48 +61,79 @@ DEVICE = os.getenv("DEVICE", "auto").lower()
 
 # Инициализация ИИ-модели СТРОГО в реальном режиме!
 if not MOCK_MODE:
-    if DEVICE == "cuda":
-        if not torch.cuda.is_available():
-            raise RuntimeError("Запрошено устройство 'cuda', но CUDA недоступна.")
-        DTYPE = torch.float16
-        DEVICE_MAP = "auto"  # для распределения по нескольким GPU (если есть)
-        LOW_MEM = True
-    elif DEVICE == "cpu":
-        DTYPE = torch.float32
-        DEVICE_MAP = None
-        LOW_MEM = True  # можно оставить True, но на CPU не критично
-    else:  # "auto"
-        if torch.cuda.is_available():
+    # ---------- Загрузка OCR-модели (если USE_OCR=true) ----------
+    if USE_OCR:
+        DEVICE_OVERRIDE = os.getenv("DEVICE", "auto").lower()
+        if DEVICE_OVERRIDE == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA requested but not available")
             DEVICE = "cuda"
             DTYPE = torch.float16
             DEVICE_MAP = "auto"
-            LOW_MEM = True
-        else:
+        elif DEVICE_OVERRIDE == "cpu":
             DEVICE = "cpu"
             DTYPE = torch.float32
             DEVICE_MAP = None
-            LOW_MEM = True
-    logger.info(f"Выбрано устройство: {DEVICE}, dtype: {DTYPE}")
+        else:
+            DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+            DTYPE = torch.float16 if DEVICE == "cuda" else torch.float32
+            DEVICE_MAP = "auto" if DEVICE == "cuda" else None
 
-    try:
+        logger.info(f"Загрузка OCR-модели на {DEVICE} с dtype {DTYPE}")
         model = QianfanOCRForConditionalGeneration.from_pretrained(
             MODEL_PATH,
-            torch_dtype=torch.float32,
-            device_map=None,
-            low_cpu_mem_usage=False
+            torch_dtype=DTYPE,
+            device_map=DEVICE_MAP,
+            low_cpu_mem_usage=True,
         )
         if DEVICE == "cpu":
-            model = model.to(DEVICE)  # явно на CPU
+            model = model.to(DEVICE)
         tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
         image_processor = AutoImageProcessor.from_pretrained(MODEL_PATH, trust_remote_code=True)
-        logger.info("Реальная ИИ-модель успешно загружена на CPU!")
+        logger.info("OCR-модель загружена")
+    else:
+        logger.info("OCR-модель отключена (USE_OCR=false)")
+        # Заглушки, чтобы не было ошибок в эндпоинтах при обращении
+        model = None
+        tokenizer = None
+        image_processor = None
+
+    # ---------- Загрузка текстовой модели Qwen ----------
+    logger.info("Загрузка текстовой модели Qwen...")
+    try:
+
+        TEXT_MODEL_NAME = os.getenv("TEXT_MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct")
+
+        # Определяем устройство для текстовой модели
+        text_dev = os.getenv("TEXT_DEVICE", "auto").lower()
+        if text_dev == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("TEXT_DEVICE=cuda but CUDA not available")
+            TEXT_DEVICE = "cuda"
+        elif text_dev == "cpu":
+            TEXT_DEVICE = "cpu"
+        else:
+            TEXT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+        TEXT_MODEL = AutoModelForCausalLM.from_pretrained(
+            TEXT_MODEL_NAME,
+            device_map="auto" if TEXT_DEVICE == "cuda" else None,
+            trust_remote_code=True,
+        )
+
+        if TEXT_DEVICE == "cpu":
+            TEXT_MODEL = TEXT_MODEL.to("cpu")
+
+        TEXT_TOKENIZER = AutoTokenizer.from_pretrained(TEXT_MODEL_NAME, trust_remote_code=True)
+        if TEXT_TOKENIZER.pad_token is None:
+            TEXT_TOKENIZER.pad_token = TEXT_TOKENIZER.eos_token
+
+        logger.info(f"Текстовая модель {TEXT_MODEL_NAME} загружена на {TEXT_DEVICE}")
     except Exception as e:
-        logger.error(f"Не удалось загрузить модель на CPU: {e}")
+        logger.error(f"Не удалось загрузить текстовую модель: {e}")
         raise
 else:
-    logger.info("=== ЗАПУЩЕН ДИАГНОСТИЧЕСКИЙ MOCK-РЕЖИМ ===")
-
-
+    logger.info("Мок-режим: модели не загружаются")
 def calculate_visual_phash(pil_image: Image.Image) -> str:
     """
     Быстрый чистый расчет перцептивного хэша (pHash) изображения на базе Pillow.
@@ -407,19 +441,8 @@ def get_text_model():
 
     logger.info(f"Загрузка текстовой модели {TEXT_MODEL_NAME} на устройство {TEXT_DEVICE}")
 
-    # Загружаем модель с квантизацией 4-bit для экономии памяти
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-    )
-
     _text_model = AutoModelForCausalLM.from_pretrained(
         TEXT_MODEL_NAME,
-        quantization_config=bnb_config,
         device_map="auto" if TEXT_DEVICE == "cuda" else None,
         trust_remote_code=True,
     )
@@ -440,61 +463,68 @@ def extract_json_from_markdown(markdown_text: str, max_tokens: int = 512) -> dic
     Использует текстовую LLM для извлечения структурированных полей из Markdown-текста.
     Возвращает словарь с извлечёнными полями.
     """
-    prompt = f"""
-Ты — интеллектуальный ассистент. Извлеки из следующего текста структурированные данные и верни их в формате JSON.
 
-Извлеки следующие поля:
-- Место отказа (дорога, станция, перегон, км, пикеты)
-- Дата (год-месяц-день)
-- Время начала отказа (часы-минуты)
-- Серия локомотива
-- Номер секции локомотива
-- Договор (номер и наименование)
-- Причина отказа
-- Вид отказа (производственный, деградационный и т.п.)
-- Оборудование локомотива
-- Наименование виновной организации (строго название компании в кавычках)
+    def extract_json_from_markdown(markdown_text: str, max_tokens: int = 512) -> dict:
+        if TEXT_MODEL is None or TEXT_TOKENIZER is None:
+            raise RuntimeError("Текстовая модель не загружена")
 
-Если какое-то поле отсутствует, оставь его пустым или со значением null.
-Ответ дай строго в виде JSON без пояснений.
+        messages = [
+            {"role": "system", "content": "Ты — ассистент, который извлекает структурированные данные из текста."},
+            {"role": "user", "content": f"""
+    Извлеки из следующего текста поля в формате JSON:
+    - Место отказа (дорога, станция, перегон, км, пикеты)
+    - Дата (год-месяц-день)
+    - Время начала отказа (часы-минуты)
+    - Серия локомотива
+    - Номер секции локомотива
+    - Договор (номер и наименование)
+    - Причина отказа
+    - Вид отказа (производственный, деградационный и т.п.)
+    - Оборудование локомотива
+    - Наименование виновной организации
 
-Текст:
-{markdown_text}
-"""
-    model, tokenizer = get_text_model()
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
-    if TEXT_DEVICE == "cuda":
-        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    Если поле отсутствует, используй null. Ответ дай строго в виде JSON без пояснений.
 
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_tokens,
-            do_sample=False,
-            temperature=0.0,
-            pad_token_id=tokenizer.pad_token_id,
-        )
+    Текст:
+    {markdown_text}
+    """}
+        ]
 
-    generated = tokenizer.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-    # Пытаемся извлечь JSON
-    try:
-        # Ищем фигурные скобки
-        start = generated.find('{')
-        end = generated.rfind('}') + 1
-        if start != -1 and end > start:
-            json_str = generated[start:end]
-            return json.loads(json_str)
-        else:
-            logger.warning("Не удалось найти JSON в ответе модели")
-            return {"raw_output": generated}
-    except Exception as e:
-        logger.error(f"Ошибка парсинга JSON: {e}")
-        return {"error": "Ошибка парсинга JSON", "raw_output": generated}
+        prompt = TEXT_TOKENIZER.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = TEXT_TOKENIZER(prompt, return_tensors="pt", truncation=True, max_length=4096)
+        if TEXT_DEVICE == "cuda":
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = TEXT_MODEL.generate(
+                **inputs,
+                max_new_tokens=max_tokens,
+                do_sample=False,
+                temperature=0.0,
+                pad_token_id=TEXT_TOKENIZER.pad_token_id,
+            )
+
+        generated = TEXT_TOKENIZER.decode(outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+
+        # Парсинг JSON
+        try:
+            start = generated.find('{')
+            end = generated.rfind('}') + 1
+            if start != -1 and end > start:
+                return json.loads(generated[start:end])
+            else:
+                logger.warning("Не удалось найти JSON в ответе модели")
+                return {"raw_output": generated}
+        except Exception as e:
+            logger.error(f"Ошибка парсинга JSON: {e}")
+            return {"error": "Ошибка парсинга JSON", "raw_output": generated}
 
 # ---------- Эндпоинты ----------
 
 @app.post("/ocr", response_model=OCRResponse)
 async def ocr_endpoint(request: Request, file: Optional[UploadFile] = File(None), max_tokens: int = Form(default=512)):
+    if not USE_OCR:
+        raise HTTPException(503, "OCR-модель отключена. Установите USE_OCR=true в окружении.")
     # Распечатываем всё, что прислал Spring Boot во внутреннюю сеть Docker
     headers = dict(request.headers)
     logger.info("=== ДИАГНОСТИКА ЗАПРОСА /ocr ===")
@@ -516,6 +546,8 @@ async def ocr_endpoint(request: Request, file: Optional[UploadFile] = File(None)
 
 @app.post("/process", response_model=OCRResponse)
 async def process_endpoint(request: Request, file: Optional[UploadFile] = File(None), max_tokens: int = Form(default=512)):
+    if not USE_OCR:
+        raise HTTPException(503, "OCR-модель отключена. Установите USE_OCR=true в окружении.")
     headers = dict(request.headers)
     logger.info("=== ДИАГНОСТИКА ЗАПРОСА /process ===")
     logger.info(f"Заголовки запроса:\n{json.dumps(headers, indent=2)}")
